@@ -45,10 +45,9 @@ typedef struct
 
 extern "C" void call_sha256_oct_avx2_from_c(SHA256_ARGS * args, uint32_t size_in_blocks);
 
-static constexpr int    CPU_GROUP_SIZE = 32768;
+static constexpr int    CPU_GROUP_SIZE = 4096;
 static constexpr int    HASH_BATCH_SIZE = 8;
 static constexpr double STATUS_INTERVAL_SEC = 5.0;
-static constexpr double SAVE_PROGRESS_INTERVAL = 300.0;
 ALIGN32 static uint32_t Sha256Init[8][16] = {
     { 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
     { 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
@@ -59,14 +58,6 @@ ALIGN32 static uint32_t Sha256Init[8][16] = {
     { 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
     { 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 }
 };
-
-static int                                  g_progressSaveCount = 0;
-static unsigned long long                   g_candidatesFound = 0ULL;
-static unsigned long long                   g_jumpsCount = 0ULL;
-static uint64_t                             g_jumpSize = 0ULL;
-static std::vector<std::string>             g_threadPrivateKeys;
-static bool                                 g_saveCandidates = false;
-
 
 static inline std::string bytesToHex(const uint8_t* data, size_t len)
 {
@@ -91,31 +82,6 @@ static void writeFoundKey(const std::string& privHex,
         return;
     }
     ofs << privHex << ' ' << pubHex << ' ' << wif << ' ' << address << '\n';
-}
-
-
-static void appendCandidateToFile(const std::string& privHex,
-    const std::string& pubHex,
-    const std::string& hash160Hex)
-{
-    ++g_candidatesFound;
-    if (!g_saveCandidates) return;
-
-#pragma omp critical(candidates_io)
-    {
-        std::ofstream ofs("candidates.txt", std::ios::app);
-        if (ofs)
-            ofs << privHex << ' ' << pubHex << ' ' << hash160Hex << '\n';
-        else
-            std::cerr << "Cannot open candidates.txt for writing\n";
-    }
-}
-
-void saveProgressToFile(const std::string& progressStr)
-{
-    std::ofstream ofs("progress.txt", std::ios::app);
-    if (ofs) ofs << progressStr << "\n";
-    else     std::cerr << "Cannot open progress.txt for writing\n";
 }
 
 std::vector<uint64_t> hexToBigNum(const std::string& hex)
@@ -304,8 +270,7 @@ static void printUsage(const char* prog)
 {
     std::cerr << "Usage: " << prog
         << " -a <Base58_P2PKH> -r <START:END>"
-        << " [-p <HEXLEN>] [-j <JUMP>] [-s]"
-        << " [-t <THREADS>] [--public-deny <HEXLEN>]\n";
+        << " [-t <THREADS>]\n";
 }
 
 static std::string formatElapsedTime(double sec)
@@ -325,15 +290,9 @@ static void printStats(int nCPU,
     double mks,
     unsigned long long checked,
     double elapsed,
-    int saves,
-    long double prog,
-    bool showCand,
-    unsigned long long candCnt,
-    bool showJump,
-    unsigned long long jumpCnt)
+    long double prog)
 {
-    //const int lines = 10 + (showCand ? 1 : 0) + (showJump ? 1 : 0);
-    const int lines = 10;
+    const int lines = 9;
     static bool first = true;
     if (!first) std::cout << "\033[" << lines << "A";
     else       first = false;
@@ -346,10 +305,7 @@ static void printStats(int nCPU,
         << "Total Checked : " << checked << "\n"
         << "Elapsed Time  : " << formatElapsedTime(elapsed) << "\n"
         << "Range         : " << range << "\n"
-        << "Progress      : " << std::fixed << std::setprecision(4) << prog << " %\n"
-        << "Progress Save : " << saves << "\n";
-    //if (showCand) std::cout << "Candidates    : " << candCnt << "\n";
-    //if (showJump) std::cout << "Jumps         : " << jumpCnt << "\n";
+        << "Progress      : " << std::fixed << std::setprecision(4) << prog << " %\n";
     std::cout.flush();
 }
 
@@ -358,13 +314,9 @@ static std::vector<ThreadRange> g_threadRanges;
 
 int main(int argc, char* argv[])
 {
-    bool aOK = false, rOK = false, pOK = false, jOK = false, sOK = false;
-    bool tOK = false, denyOK = false;
+    bool aOK = false, rOK = false, tOK = false;
 
-    int  prefLenHex = 0;
-    uint64_t jumpSize = 0ULL;
     int  userThreads = 0;
-    int  denyHexLen = 0;
 
     std::string targetAddress, rangeStr;
     std::vector<uint8_t> targetHash160;
@@ -377,31 +329,10 @@ int main(int argc, char* argv[])
         else if (!std::strcmp(argv[i], "-r") && i + 1 < argc) {
             rangeStr = argv[++i]; rOK = true;
         }
-        else if (!std::strcmp(argv[i], "-p") && i + 1 < argc) {
-            prefLenHex = std::stoi(argv[++i]); pOK = true;
-            if (prefLenHex < 1 || prefLenHex>40) {
-                std::cerr << "-p must be 1-40\n"; return 1;
-            }
-        }
-        else if (!std::strcmp(argv[i], "-j") && i + 1 < argc) {
-            jumpSize = std::stoull(argv[++i]); jOK = true;
-            if (jumpSize == 0) {
-                std::cerr << "-j must be >0\n"; return 1;
-            }
-        }
-        else if (!std::strcmp(argv[i], "-s")) {
-            sOK = true;
-        }
         else if (!std::strcmp(argv[i], "-t") && i + 1 < argc) {
             userThreads = std::stoi(argv[++i]); tOK = true;
             if (userThreads < 1) {
                 std::cerr << "-t must be >0\n"; return 1;
-            }
-        }
-        else if (!std::strcmp(argv[i], "--public-deny") && i + 1 < argc) {
-            denyHexLen = std::stoi(argv[++i]); denyOK = true;
-            if (denyHexLen < 1 || denyHexLen>64) {
-                std::cerr << "--public-deny must be 1-64\n"; return 1;
             }
         }
         else {
@@ -409,13 +340,6 @@ int main(int argc, char* argv[])
         }
     }
     if (!aOK || !rOK) { printUsage(argv[0]); return 1; }
-    if (jOK && !pOK) { std::cerr << "-j requires -p\n"; return 1; }
-
-    g_saveCandidates = sOK;
-    const bool partialEnabled = pOK;
-    const bool jumpEnabled = jOK;
-    const bool pubDenyEnabled = denyOK;
-    g_jumpSize = jumpEnabled ? jumpSize : 0ULL;
 
     int hwThreads = omp_get_num_procs();
     int numCPUs = tOK ? std::min(userThreads, hwThreads) : hwThreads;
@@ -445,8 +369,6 @@ int main(int argc, char* argv[])
         singleElementVector(1ULL));
     long double totalRangeLD = hexStrToLongDouble(bigNumToHex(rangeSize));
 
-    g_threadPrivateKeys.assign(numCPUs, "0");
-
     auto [chunk, remainder] = bigNumDivide(rangeSize, (uint64_t)numCPUs);
     g_threadRanges.resize(numCPUs);
     std::vector<uint64_t> cur = startBN;
@@ -465,7 +387,6 @@ int main(int argc, char* argv[])
     double             globalElapsed = 0.0, mkeys = 0.0;
     auto tStart = std::chrono::high_resolution_clock::now();
     auto lastStat = tStart;
-    auto lastSave = tStart;
     const int hLength = (CPU_GROUP_SIZE / 2 - 1);
     bool        matchFound = false;
     std::string foundPriv, foundPub, foundWIF;
@@ -476,8 +397,7 @@ int main(int argc, char* argv[])
 #pragma omp parallel num_threads(numCPUs) \
     shared(globalChecked,globalElapsed,mkeys,matchFound, \
            foundPriv,foundPub,foundWIF, \
-           tStart,lastStat,lastSave,g_progressSaveCount, \
-           g_threadPrivateKeys,g_candidatesFound,g_jumpsCount)
+           tStart,lastStat)
     {
         int tid = omp_get_thread_num();
 
@@ -697,39 +617,11 @@ int main(int argc, char* argv[])
                             : 0.0L;
 
                         printStats(numCPUs, targetAddress, targetHashHex, displayRange,
-                            mkeys, globalChecked, globalElapsed,
-                            g_progressSaveCount, prog,
-                            partialEnabled, g_candidatesFound,
-                            false, 0);
+                            mkeys, globalChecked, globalElapsed, prog);
 
                         lastStat = now;
                     }
                 }
-
-                /*if (std::chrono::duration<double>(now - lastSave).count()
-                    >= SAVE_PROGRESS_INTERVAL)
-                {
-#pragma omp critical
-                    {
-                        g_progressSaveCount++;
-                        auto nowSave = std::chrono::high_resolution_clock::now();
-                        double sinceStart =
-                            std::chrono::duration<double>(nowSave - tStart).count();
-
-                        std::ostringstream oss;
-                        oss << "Progress Save #" << g_progressSaveCount
-                            << " at " << sinceStart << " sec: "
-                            << "TotalChecked=" << globalChecked << ", "
-                            << "ElapsedTime=" << formatElapsedTime(globalElapsed) << ", "
-                            << "Mkeys/s=" << std::fixed << std::setprecision(2)
-                            << mkeys << "\n";
-                        for (int k = 0; k < numCPUs; ++k) {
-                            oss << "Thread Key " << k << ": " << g_threadPrivateKeys[k] << "\n";
-                        }
-                        saveProgressToFile(oss.str());
-                        lastSave = now;
-                    }
-                }*/
             }
         }
     }
