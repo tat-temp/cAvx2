@@ -40,10 +40,10 @@ typedef struct
     __declspec(align(32))_p digest5;
     __declspec(align(32))_p digest6;
     __declspec(align(32))_p digest7;*/
-    void* data[8];
+    //void* data[8];
 }SHA256_ARGS;
 
-extern "C" void call_sha256_oct_avx2_from_c(SHA256_ARGS * args, uint32_t size_in_blocks);
+//extern "C" void call_sha256_oct_avx2_from_c(SHA256_ARGS * args, uint32_t size_in_blocks);
 
 static constexpr int    CPU_GROUP_SIZE = 4096;
 static constexpr int    HASH_BATCH_SIZE = 8;
@@ -262,11 +262,18 @@ static void computeHash160BatchBinSingle3(
         (const uint8_t*)&shaIn[0], (const uint8_t*)&shaIn[1], (const uint8_t*)&shaIn[2], (const uint8_t*)&shaIn[3], (const uint8_t*)&shaIn[4], (const uint8_t*)&shaIn[5], (const uint8_t*)&shaIn[6], (const uint8_t*)&shaIn[7],
         (uint8_t*)&shaIn[0], (uint8_t*)&shaIn[1], (uint8_t*)&shaIn[2], (uint8_t*)&shaIn[3], (uint8_t*)&shaIn[4], (uint8_t*)&shaIn[5], (uint8_t*)&shaIn[6], (uint8_t*)&shaIn[7]);
 
+    //ripemd160avx2::ripemd160avx2_32(
+    //    (unsigned char*)&sha256_args.digest[0 * 64], (unsigned char*)&sha256_args.digest[1 * 64], (unsigned char*)&sha256_args.digest[2 * 64],
+    //    (unsigned char*)&sha256_args.digest[3 * 64], (unsigned char*)&sha256_args.digest[4 * 64], (unsigned char*)&sha256_args.digest[5 * 64],
+    //    (unsigned char*)&sha256_args.digest[6 * 64], (unsigned char*)&sha256_args.digest[7 * 64],
+    //    outHash[0], outHash[1], outHash[2], outHash[3], outHash[4], outHash[5], outHash[6], outHash[7]);
+
     ripemd160avx2::ripemd160avx2_32(
-        (unsigned char*)&sha256_args.digest[0 * 64], (unsigned char*)&sha256_args.digest[1 * 64], (unsigned char*)&sha256_args.digest[2 * 64],
-        (unsigned char*)&sha256_args.digest[3 * 64], (unsigned char*)&sha256_args.digest[4 * 64], (unsigned char*)&sha256_args.digest[5 * 64],
-        (unsigned char*)&sha256_args.digest[6 * 64], (unsigned char*)&sha256_args.digest[7 * 64],
+        (unsigned char*)&shaIn[0], (unsigned char*)&shaIn[1], (unsigned char*)&shaIn[2],
+        (unsigned char*)&shaIn[3], (unsigned char*)&shaIn[4], (unsigned char*)&shaIn[5],
+        (unsigned char*)&shaIn[6], (unsigned char*)&shaIn[7],
         outHash[0], outHash[1], outHash[2], outHash[3], outHash[4], outHash[5], outHash[6], outHash[7]);
+
 }
 
 static void printUsage(const char* prog)
