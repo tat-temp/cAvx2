@@ -248,16 +248,19 @@ static void computeHash160BatchBinSingle3(
 
     std::memcpy(&sha256_args.digest, &Sha256Init, 8 * 64);
 
-    sha256_args.data[0] = &shaIn[0];
-    sha256_args.data[1] = &shaIn[1];
-    sha256_args.data[2] = &shaIn[2];
-    sha256_args.data[3] = &shaIn[3];
-    sha256_args.data[4] = &shaIn[4];
-    sha256_args.data[5] = &shaIn[5];
-    sha256_args.data[6] = &shaIn[6];
-    sha256_args.data[7] = &shaIn[7];
+    //sha256_args.data[0] = &shaIn[0];
+    //sha256_args.data[1] = &shaIn[1];
+    //sha256_args.data[2] = &shaIn[2];
+    //sha256_args.data[3] = &shaIn[3];
+    //sha256_args.data[4] = &shaIn[4];
+    //sha256_args.data[5] = &shaIn[5];
+    //sha256_args.data[6] = &shaIn[6];
+    //sha256_args.data[7] = &shaIn[7];
 
-    call_sha256_oct_avx2_from_c(&sha256_args, 1);
+    //call_sha256_oct_avx2_from_c(&sha256_args, 1);
+    sha256avx2_8B(
+        (const uint8_t*)&shaIn[0], (const uint8_t*)&shaIn[1], (const uint8_t*)&shaIn[2], (const uint8_t*)&shaIn[3], (const uint8_t*)&shaIn[4], (const uint8_t*)&shaIn[5], (const uint8_t*)&shaIn[6], (const uint8_t*)&shaIn[7],
+        (uint8_t*)&shaIn[0], (uint8_t*)&shaIn[1], (uint8_t*)&shaIn[2], (uint8_t*)&shaIn[3], (uint8_t*)&shaIn[4], (uint8_t*)&shaIn[5], (uint8_t*)&shaIn[6], (uint8_t*)&shaIn[7]);
 
     ripemd160avx2::ripemd160avx2_32(
         (unsigned char*)&sha256_args.digest[0 * 64], (unsigned char*)&sha256_args.digest[1 * 64], (unsigned char*)&sha256_args.digest[2 * 64],
