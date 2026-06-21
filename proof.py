@@ -88,7 +88,7 @@ def run_cyclone_and_watch(
     range_arg: str,
     address: str,
     grid_arg: Optional[str],
-    match_marker: str = "======== FOUND MATCH! =================================",
+    match_marker: str = "FOUND MATCH!",
     timeout: Optional[int] = None,
 ) -> Tuple[bool, Optional[str]]:
     args = ["cmd.exe", "/c", cyclone_path, "-r", range_arg, "-a", address, "-t", "1"]
@@ -237,8 +237,8 @@ def main() -> None:
     )
     parser.add_argument("--range", "-r", dest="range_arg", required=True,
                         help="HEX range START:END (e.g. 200000000:3FFFFFFFF)")
-    parser.add_argument("--cyclone-path", "-c", dest="cyclone_path", default="./CUDACyclone",
-                        help="Path to CUDACyclone binary")
+    parser.add_argument("--cyclone-path", "-c", dest="cyclone_path", default="./Cyclone",
+                        help="Path to Cyclone binary")
     parser.add_argument("--grid", dest="grid_arg", default="512,512",
                         help="Value for --grid passed to CUDACyclone (e.g. 512,512)")
     parser.add_argument("--batch", dest="batch", type=int, default=None,
@@ -252,9 +252,6 @@ def main() -> None:
     parser.add_argument("--quartile-count", type=int, default=20,
                         help="Random points per quartile (default: 20)")
     args = parser.parse_args()
-
-    sys.argv[1] = "--range"
-    sys.argv[2] = "10000:1ffff"
 
     try:
         start_i, end_i = parse_hex_range(args.range_arg)

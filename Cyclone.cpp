@@ -30,34 +30,9 @@
 #define ALIGN32 __attribute__((aligned(32)))
 #endif
 
-typedef struct
-{
-    uint8_t digest[8 * 64];
-    /*__declspec(align(32))_p digest1;
-    __declspec(align(32))_p digest2;
-    __declspec(align(32))_p digest3;
-    __declspec(align(32))_p digest4;
-    __declspec(align(32))_p digest5;
-    __declspec(align(32))_p digest6;
-    __declspec(align(32))_p digest7;*/
-    //void* data[8];
-}SHA256_ARGS;
-
-//extern "C" void call_sha256_oct_avx2_from_c(SHA256_ARGS * args, uint32_t size_in_blocks);
-
 static constexpr int    CPU_GROUP_SIZE = 4096;
 static constexpr int    HASH_BATCH_SIZE = 8;
 static constexpr double STATUS_INTERVAL_SEC = 5.0;
-ALIGN32 static uint32_t Sha256Init[8][16] = {
-    { 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x6a09e667, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0xbb67ae85, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x3c6ef372, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0xa54ff53a, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0x510e527f, 0x510e527f, 0x510e527f, 0x510e527f, 0x510e527f, 0x510e527f, 0x510e527f, 0x510e527f, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x9b05688c, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x1f83d9ab, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 },
-    { 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x5be0cd19, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000 }
-};
 
 static inline std::string bytesToHex(const uint8_t* data, size_t len)
 {
@@ -228,7 +203,6 @@ static void computeHash160BatchBinSingle3(
     Point* p,
     uint8_t outHash[][20])
 {
-    ALIGN32 SHA256_ARGS sha256_args;
     uint8_t shaIn[HASH_BATCH_SIZE][64];
 
     std::memset(&shaIn, 0, HASH_BATCH_SIZE * 64);
@@ -246,27 +220,9 @@ static void computeHash160BatchBinSingle3(
         shaIn[i][63] = uint8_t((33 * 8));
     }
 
-    std::memcpy(&sha256_args.digest, &Sha256Init, 8 * 64);
-
-    //sha256_args.data[0] = &shaIn[0];
-    //sha256_args.data[1] = &shaIn[1];
-    //sha256_args.data[2] = &shaIn[2];
-    //sha256_args.data[3] = &shaIn[3];
-    //sha256_args.data[4] = &shaIn[4];
-    //sha256_args.data[5] = &shaIn[5];
-    //sha256_args.data[6] = &shaIn[6];
-    //sha256_args.data[7] = &shaIn[7];
-
-    //call_sha256_oct_avx2_from_c(&sha256_args, 1);
     sha256avx2_8B(
         (const uint8_t*)&shaIn[0], (const uint8_t*)&shaIn[1], (const uint8_t*)&shaIn[2], (const uint8_t*)&shaIn[3], (const uint8_t*)&shaIn[4], (const uint8_t*)&shaIn[5], (const uint8_t*)&shaIn[6], (const uint8_t*)&shaIn[7],
         (uint8_t*)&shaIn[0], (uint8_t*)&shaIn[1], (uint8_t*)&shaIn[2], (uint8_t*)&shaIn[3], (uint8_t*)&shaIn[4], (uint8_t*)&shaIn[5], (uint8_t*)&shaIn[6], (uint8_t*)&shaIn[7]);
-
-    //ripemd160avx2::ripemd160avx2_32(
-    //    (unsigned char*)&sha256_args.digest[0 * 64], (unsigned char*)&sha256_args.digest[1 * 64], (unsigned char*)&sha256_args.digest[2 * 64],
-    //    (unsigned char*)&sha256_args.digest[3 * 64], (unsigned char*)&sha256_args.digest[4 * 64], (unsigned char*)&sha256_args.digest[5 * 64],
-    //    (unsigned char*)&sha256_args.digest[6 * 64], (unsigned char*)&sha256_args.digest[7 * 64],
-    //    outHash[0], outHash[1], outHash[2], outHash[3], outHash[4], outHash[5], outHash[6], outHash[7]);
 
     ripemd160avx2::ripemd160avx2_32(
         (unsigned char*)&shaIn[0], (unsigned char*)&shaIn[1], (unsigned char*)&shaIn[2],
