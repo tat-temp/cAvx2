@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cyclone build script.
+# Cyclone build script.  (LF-only; enforced by .gitattributes.)
 #
 #   ./build.sh [baseline|native] [output-name]
 #

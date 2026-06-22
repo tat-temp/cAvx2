@@ -1,0 +1,6 @@
+# Shell scripts must stay LF: CRLF makes /usr/bin/env see "bash\r" and the
+# script fails to run. This overrides core.autocrlf on every platform.
+*.sh text eol=lf
+
+# PowerShell scripts are Windows-side; keep them CRLF.
+*.ps1 text eol=crlf
