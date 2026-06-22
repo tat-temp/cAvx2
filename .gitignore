@@ -8,6 +8,7 @@
 *.exe
 *.dll
 *.obj
+*.s
 __pycache__/
 found_keys.txt
 cyclone_tests_results.txt

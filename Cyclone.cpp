@@ -276,8 +276,8 @@ static int runFieldSelfTest(uint64_t iters)
         x.Mod(P);                                 // 0 <= x < P
     };
 
-    uint64_t mulChecks = 0, sqrChecks = 0, mulFail = 0, sqrFail = 0;
-    Int a, b, r1, r2, s1, s2;
+    uint64_t mulChecks = 0, sqrChecks = 0, mulFail = 0, sqrFail = 0, adxFail = 0;
+    Int a, b, r1, r2, r3, s1, s2;
 
     for (uint64_t k = 0; k < iters; ++k) {
         if (k < (uint64_t)(NS * NS)) {            // every special x special pair
@@ -290,16 +290,26 @@ static int runFieldSelfTest(uint64_t iters)
             randField(a); randField(b);
         }
 
-        // multiply: specialized (K1 fold) vs Montgomery oracle
-        r1.ModMulK1(&a, &b);  canon(r1);
+        // multiply: legacy K1 fold vs Montgomery oracle, and the dual-carry
+        // (adx) variant directly vs legacy (gold-standard byte-for-byte gate).
+        r1.ModMulK1(&a, &b);      canon(r1);
+        r3.ModMulK1_adx(&a, &b);  canon(r3);
         r2.ModMul(&a, &b);
         if (!r1.IsEqual(&r2)) {
             if (mulFail < 5)
-                std::cerr << "MUL mismatch\n  a  =" << a.GetBase16()
+                std::cerr << "MUL mismatch (legacy vs Montgomery)\n  a  =" << a.GetBase16()
                           << "\n  b  =" << b.GetBase16()
                           << "\n  k1 =" << r1.GetBase16()
                           << "\n  ref=" << r2.GetBase16() << "\n";
             ++mulFail;
+        }
+        if (!r3.IsEqual(&r1)) {
+            if (adxFail < 5)
+                std::cerr << "ADX mismatch (adx vs legacy)\n  a  =" << a.GetBase16()
+                          << "\n  b  =" << b.GetBase16()
+                          << "\n  adx=" << r3.GetBase16()
+                          << "\n  k1 =" << r1.GetBase16() << "\n";
+            ++adxFail;
         }
         ++mulChecks;
 
@@ -317,9 +327,10 @@ static int runFieldSelfTest(uint64_t iters)
     }
 
     std::cout << "field selftest: ModMulK1 " << mulChecks << " checks, "
-              << mulFail << " fail; ModSquareK1 " << sqrChecks << " checks, "
-              << sqrFail << " fail\n";
-    bool ok = (mulFail == 0 && sqrFail == 0);
+              << mulFail << " fail; ModMulK1_adx " << mulChecks << " checks, "
+              << adxFail << " fail (vs legacy); ModSquareK1 " << sqrChecks
+              << " checks, " << sqrFail << " fail\n";
+    bool ok = (mulFail == 0 && sqrFail == 0 && adxFail == 0);
     std::cout << (ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n");
     return ok ? 0 : 1;
 }

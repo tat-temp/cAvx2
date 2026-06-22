@@ -926,7 +926,102 @@ void Int::MontgomeryMult(Int *a, Int *b) {
 
 // SecpK1 specific section -----------------------------------------------------------------------------
 
+// 4x4 -> 8-limb multiply with mulx + two independent carry chains (adcx on CF
+// for low words, adox on OF for high words). Hand-written asm because GCC does
+// NOT emit adcx/adox from the __builtin_ia32_addcarryx_u64 intrinsic (it
+// collapses to a single adc chain), which is the whole point of the dual chain.
+// Algorithm is the operand-scanning multiply validated in C against legacy.
+static inline void mul256_adx(const uint64_t *A, const uint64_t *B, uint64_t *R)
+{
+  uint64_t r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, r6 = 0, r7 = 0;
+  uint64_t zero = 0;
+  __asm__ volatile(
+      // ---- row 0: rdx = B[0], single CF chain -> r0..r4 ----
+      "movq   (%[b]), %%rdx\n\t"
+      "mulx   (%[a]),   %[r0], %[r1]\n\t"
+      "mulx   8(%[a]),  %%rax, %[r2]\n\t"  "addq %%rax, %[r1]\n\t"
+      "mulx   16(%[a]), %%rax, %[r3]\n\t"  "adcq %%rax, %[r2]\n\t"
+      "mulx   24(%[a]), %%rax, %[r4]\n\t"  "adcq %%rax, %[r3]\n\t"
+      "adcq   $0, %[r4]\n\t"
+      // ---- row 1: rdx = B[1] -> r1..r5, fold tail to r7 ----
+      "movq   8(%[b]), %%rdx\n\t"
+      "xorl   %%eax, %%eax\n\t"            // CF = OF = 0
+      "mulx   (%[a]),   %%rax, %%rbx\n\t" "adcx %%rax, %[r1]\n\t" "adox %%rbx, %[r2]\n\t"
+      "mulx   8(%[a]),  %%rax, %%rbx\n\t" "adcx %%rax, %[r2]\n\t" "adox %%rbx, %[r3]\n\t"
+      "mulx   16(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r3]\n\t" "adox %%rbx, %[r4]\n\t"
+      "mulx   24(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r4]\n\t" "adox %%rbx, %[r5]\n\t"
+      "adcx   %[z], %[r5]\n\t" "adox %[z], %[r6]\n\t" "adcx %[z], %[r6]\n\t"
+      "adox   %[z], %[r7]\n\t" "adcx %[z], %[r7]\n\t"
+      // ---- row 2: rdx = B[2] -> r2..r6, fold tail to r7 ----
+      "movq   16(%[b]), %%rdx\n\t"
+      "xorl   %%eax, %%eax\n\t"
+      "mulx   (%[a]),   %%rax, %%rbx\n\t" "adcx %%rax, %[r2]\n\t" "adox %%rbx, %[r3]\n\t"
+      "mulx   8(%[a]),  %%rax, %%rbx\n\t" "adcx %%rax, %[r3]\n\t" "adox %%rbx, %[r4]\n\t"
+      "mulx   16(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r4]\n\t" "adox %%rbx, %[r5]\n\t"
+      "mulx   24(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r5]\n\t" "adox %%rbx, %[r6]\n\t"
+      "adcx   %[z], %[r6]\n\t" "adox %[z], %[r7]\n\t" "adcx %[z], %[r7]\n\t"
+      // ---- row 3: rdx = B[3] -> r3..r7 (top carry is 0) ----
+      "movq   24(%[b]), %%rdx\n\t"
+      "xorl   %%eax, %%eax\n\t"
+      "mulx   (%[a]),   %%rax, %%rbx\n\t" "adcx %%rax, %[r3]\n\t" "adox %%rbx, %[r4]\n\t"
+      "mulx   8(%[a]),  %%rax, %%rbx\n\t" "adcx %%rax, %[r4]\n\t" "adox %%rbx, %[r5]\n\t"
+      "mulx   16(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r5]\n\t" "adox %%rbx, %[r6]\n\t"
+      "mulx   24(%[a]), %%rax, %%rbx\n\t" "adcx %%rax, %[r6]\n\t" "adox %%rbx, %[r7]\n\t"
+      "adcx   %[z], %[r7]\n\t"
+      : [r0] "+&r"(r0), [r1] "+&r"(r1), [r2] "+&r"(r2), [r3] "+&r"(r3),
+        [r4] "+&r"(r4), [r5] "+&r"(r5), [r6] "+&r"(r6), [r7] "+&r"(r7)
+      : [a] "r"(A), [b] "r"(B), [z] "r"(zero)
+      : "rax", "rbx", "rdx", "cc", "memory");
+  R[0] = r0; R[1] = r1; R[2] = r2; R[3] = r3;
+  R[4] = r4; R[5] = r5; R[6] = r6; R[7] = r7;
+}
+
+// Dual-carry-chain field multiply for secp256k1.
+//
+// Same algorithm as ModMulK1 (schoolbook 4x4 -> 512-bit product, then the
+// 2^256 = 2^32+977 fold reduction), but the product is formed with mulx and two
+// INDEPENDENT carry chains so the carry propagation is not a single serial
+// dependency. The reduction is copied verbatim from ModMulK1 so only the
+// multiply differs; --selftest verifies byte-for-byte agreement with legacy.
+void Int::ModMulK1_adx(Int *a, Int *b) {
+
+  unsigned char c;
+  uint64_t t[NB64BLOCK];
+  uint64_t u10, u11;
+  uint64_t r512[8];
+
+  mul256_adx(a->bits64, b->bits64, r512);
+
+  // ---- Reduction (verbatim from ModMulK1): 512 -> 320 -> 256 ----
+  imm_umul(r512 + 4, 0x1000003D1ULL, t);
+  c = _addcarry_u64(0, r512[0], t[0], r512 + 0);
+  c = _addcarry_u64(c, r512[1], t[1], r512 + 1);
+  c = _addcarry_u64(c, r512[2], t[2], r512 + 2);
+  c = _addcarry_u64(c, r512[3], t[3], r512 + 3);
+
+  u10 = _umul128(t[4] + c, 0x1000003D1ULL, &u11);
+  c = _addcarry_u64(0, r512[0], u10, bits64 + 0);
+  c = _addcarry_u64(c, r512[1], u11, bits64 + 1);
+  c = _addcarry_u64(c, r512[2], 0, bits64 + 2);
+  c = _addcarry_u64(c, r512[3], 0, bits64 + 3);
+  bits64[4] = 0;
+#if BISIZE==512
+  bits64[5] = 0;
+  bits64[6] = 0;
+  bits64[7] = 0;
+  bits64[8] = 0;
+#endif
+}
+
 void Int::ModMulK1(Int *a, Int *b) {
+
+#ifdef FIELD_ADX
+  // Build-time routing of the hot-path field multiply to the dual-carry-chain
+  // implementation. The legacy body below stays for the default build and as
+  // the reference the --selftest compares against.
+  ModMulK1_adx(a, b);
+  return;
+#endif
 
 #ifndef WIN64
 #if (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))
