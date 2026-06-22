@@ -3,4 +3,11 @@
 ################################################################################
 
 /.vs
-/Cyclone.exe
+
+# Build / test artifacts
+*.exe
+*.dll
+*.obj
+__pycache__/
+found_keys.txt
+cyclone_tests_results.txt

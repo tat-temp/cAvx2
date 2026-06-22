@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <climits>
 #include <thread>
+#include <random>
 
 #include "p2pkh_decoder.h"
 #include "sha256_avx2.h"
@@ -234,7 +235,93 @@ static void printUsage(const char* prog)
         << "  --skip-hash     skip SHA-256/RIPEMD-160 (EC point-gen only) to\n"
         << "                  profile the EC vs hashing split\n"
         << "  --ilp <0-8>     EC point-loop interleave width (0 = original loop,\n"
-        << "                  N>0 = interleave 2xN independent point chains)\n";
+        << "                  N>0 = interleave 2xN independent point chains)\n"
+        << "  --selftest [N]  validate field ModMulK1/ModSquareK1 against an\n"
+        << "                  independent full-multiply/division oracle and exit\n";
+}
+
+// Phase 0 correctness gate. Validates the secp256k1-specialized field multiply
+// and square (ModMulK1/ModSquareK1, which reduce via the 2^256 = 2^32+977 fold)
+// against an independent oracle: the library's Montgomery path (ModMul/
+// ModSquare, which reduce via REDC). Two different reduction algorithms must
+// agree. Any future field rewrite (e.g. the dual-carry-chain mulx/adcx/adox
+// path) must keep this passing. Returns 0 on success, 1 on any mismatch.
+static int runFieldSelfTest(uint64_t iters)
+{
+    Int* P = Int::GetFieldCharacteristic();
+
+    // Canonicalize x into [0, P). ModMulK1/ModSquareK1 may leave the result
+    // congruent-but-not-fully-reduced (< 2^256); the oracle is always reduced,
+    // so normalize before comparing to test congruence, not representation.
+    auto canon = [&](Int& x) {
+        while (x.IsGreaterOrEqual(P)) x.Sub(P);
+    };
+
+    // Edge-case field elements: 0, 1, 2, P-1, P-2.
+    Int one;  one.SetInt32(1);
+    Int two;  two.SetInt32(2);
+    const int NS = 5;
+    Int specials[NS];
+    specials[0].SetInt32(0);
+    specials[1].Set(&one);
+    specials[2].Set(&two);
+    specials[3].Set(P); specials[3].Sub(&one);
+    specials[4].Set(P); specials[4].Sub(&two);
+
+    std::mt19937_64 rng(0x9E3779B97F4A7C15ULL);  // fixed seed -> reproducible
+    auto randField = [&](Int& x) {
+        x.bits64[0] = rng(); x.bits64[1] = rng();
+        x.bits64[2] = rng(); x.bits64[3] = rng();
+        x.bits64[4] = 0;
+        x.Mod(P);                                 // 0 <= x < P
+    };
+
+    uint64_t mulChecks = 0, sqrChecks = 0, mulFail = 0, sqrFail = 0;
+    Int a, b, r1, r2, s1, s2;
+
+    for (uint64_t k = 0; k < iters; ++k) {
+        if (k < (uint64_t)(NS * NS)) {            // every special x special pair
+            a.Set(&specials[k / NS]); b.Set(&specials[k % NS]);
+        } else if ((k & 7) == 0) {
+            a.Set(&specials[k % NS]); randField(b);
+        } else if ((k & 7) == 1) {
+            randField(a); b.Set(&specials[k % NS]);
+        } else {
+            randField(a); randField(b);
+        }
+
+        // multiply: specialized (K1 fold) vs Montgomery oracle
+        r1.ModMulK1(&a, &b);  canon(r1);
+        r2.ModMul(&a, &b);
+        if (!r1.IsEqual(&r2)) {
+            if (mulFail < 5)
+                std::cerr << "MUL mismatch\n  a  =" << a.GetBase16()
+                          << "\n  b  =" << b.GetBase16()
+                          << "\n  k1 =" << r1.GetBase16()
+                          << "\n  ref=" << r2.GetBase16() << "\n";
+            ++mulFail;
+        }
+        ++mulChecks;
+
+        // square: specialized (K1 fold) vs Montgomery oracle
+        s1.ModSquareK1(&a);   canon(s1);
+        s2.ModSquare(&a);
+        if (!s1.IsEqual(&s2)) {
+            if (sqrFail < 5)
+                std::cerr << "SQR mismatch\n  a  =" << a.GetBase16()
+                          << "\n  k1 =" << s1.GetBase16()
+                          << "\n  ref=" << s2.GetBase16() << "\n";
+            ++sqrFail;
+        }
+        ++sqrChecks;
+    }
+
+    std::cout << "field selftest: ModMulK1 " << mulChecks << " checks, "
+              << mulFail << " fail; ModSquareK1 " << sqrChecks << " checks, "
+              << sqrFail << " fail\n";
+    bool ok = (mulFail == 0 && sqrFail == 0);
+    std::cout << (ok ? "SELFTEST PASS\n" : "SELFTEST FAIL\n");
+    return ok ? 0 : 1;
 }
 
 static std::string formatElapsedTime(double sec)
@@ -286,6 +373,8 @@ int main(int argc, char* argv[])
     double benchSeconds = 10.0;
     bool   skipHash     = false;
     int    ilpWidth     = 0;   // 0 = original point loop; >0 = interleave width
+    bool     runSelftest   = false;
+    uint64_t selftestIters = 200000;
 
     std::string targetAddress, rangeStr;
     std::vector<uint8_t> targetHash160;
@@ -326,9 +415,24 @@ int main(int argc, char* argv[])
                 std::cerr << "--ilp must be 0..8 (0 = original loop)\n"; return 1;
             }
         }
+        else if (!std::strcmp(argv[i], "--selftest")) {
+            runSelftest = true;
+            // optional iteration count
+            if (i + 1 < argc) {
+                char* end = nullptr;
+                unsigned long long v = std::strtoull(argv[i + 1], &end, 10);
+                if (end && *end == '\0' && v > 0) { selftestIters = v; ++i; }
+            }
+        }
         else {
             printUsage(argv[0]); return 1;
         }
+    }
+
+    // Phase 0 correctness gate: needs only the field set up, not a target/range.
+    if (runSelftest) {
+        Secp256K1 secp; secp.Init();      // populates the field characteristic
+        return runFieldSelfTest(selftestIters);
     }
 
     // Benchmark mode: a real target/range are optional. Default to a wide range
