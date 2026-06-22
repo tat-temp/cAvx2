@@ -16,5 +16,11 @@ void sha256avx2_8B(
 // out[i] : 32-byte big-endian digest.
 void sha256avx2_8B_33(const uint8_t in[8][64], uint8_t out[8][32]);
 
+// Fused compressed-pubkey HASH160 (SHA-256 then RIPEMD-160) with no intermediate
+// digest buffer or middle transposes.
+// in[i]  : same 36-byte layout as sha256avx2_8B_33.
+// out[i] : 20-byte HASH160.
+void hash160_pubkey_8(const uint8_t in[8][64], uint8_t out[8][20]);
+
 #endif // SHA256_AVX2_H
 

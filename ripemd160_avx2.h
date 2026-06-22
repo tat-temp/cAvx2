@@ -24,6 +24,11 @@ void ripemd160avx2_32(
 // out[i] : 20-byte digest.
 void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]);
 
+// Core: RIPEMD-160 over 8 messages whose data words 0..7 are already supplied
+// as transposed lane vectors (lane = message). Padding words 8..15 are added
+// internally. Lets the fused pubkey hasher feed SHA output straight in.
+void ripemd160_8way_words(const __m256i in_w[8], unsigned char out[8][20]);
+
 }  // namespace ripemd160avx2
 
 #endif  // RIPEMD160_AVX2_H

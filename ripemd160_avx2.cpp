@@ -365,7 +365,7 @@ static inline void rmd_transpose8x8(__m256i r[8]) {
     r[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
 }
 
-void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]) {
+void ripemd160_8way_words(const __m256i in_w[8], unsigned char out[8][20]) {
     __m256i s[5];
     Initialize(s);
 
@@ -374,13 +374,7 @@ void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]) {
     __m256i u;
     __m256i w[16];
 
-    // Message load: transpose 32 bytes (8 little-endian words) of all 8 lanes;
-    // RIPEMD reads words little-endian so no byte-swap is needed.
-    __m256i r[8];
-    for (int i = 0; i < 8; ++i)
-        r[i] = _mm256_loadu_si256((const __m256i*)in[i]);
-    rmd_transpose8x8(r);
-    for (int i = 0; i < 8; ++i) w[i] = r[i];
+    for (int i = 0; i < 8; ++i) w[i] = in_w[i];
 
     // Constant padding words for a single 32-byte block.
     w[8]  = _mm256_set1_epi32(0x00000080);
@@ -576,6 +570,16 @@ void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]) {
         _mm_storeu_si128((__m128i*)out[i], _mm256_castsi256_si128(o[i]));
         ((uint32_t*)out[i])[4] = (uint32_t)_mm256_extract_epi32(o[i], 4);
     }
+}
+
+void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]) {
+    // Load 32 bytes (8 little-endian words) of all 8 lanes and transpose to
+    // per-word vectors; RIPEMD reads words little-endian so no byte-swap.
+    __m256i r[8];
+    for (int i = 0; i < 8; ++i)
+        r[i] = _mm256_loadu_si256((const __m256i*)in[i]);
+    rmd_transpose8x8(r);
+    ripemd160_8way_words(r, out);
 }
 
 }  // namespace ripemd160avx2

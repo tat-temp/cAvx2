@@ -194,12 +194,11 @@ static void computeHash160BatchBinSingle3(
     Point* p,
     uint8_t outHash[][20])
 {
-    // Persistent per-thread buffers. The SHA padding bytes [33..35] are constant
-    // across calls, so write them once; each call only refreshes the 33 pubkey
-    // bytes [0..32]. The specialized single-block hashes supply every other
-    // padding/length word internally.
+    // Persistent per-thread input buffer. The SHA padding bytes [33..35] are
+    // constant across calls, so write them once; each call refreshes only the
+    // 33 pubkey bytes [0..32]. The fused hasher supplies all other padding and
+    // keeps the SHA->RIPEMD digest in registers (no intermediate buffer).
     alignas(32) static thread_local uint8_t shaIn[HASH_BATCH_SIZE][64];
-    alignas(32) static thread_local uint8_t digest[HASH_BATCH_SIZE][32];
     static thread_local bool init = false;
     if (!init) {
         for (int i = 0; i < HASH_BATCH_SIZE; i++) {
@@ -212,13 +211,13 @@ static void computeHash160BatchBinSingle3(
 
     for (int i = 0; i < HASH_BATCH_SIZE; i++)
     {
-        shaIn[i][0] = isEven(&p[i].y) ? 0x02 : 0x03;
-        uint8_t* pSrc = (&p[i].x)->GetBytes();
-        std::reverse_copy(pSrc, pSrc + 32, &shaIn[i][1]);
+        // Branchless 02/03 prefix from y's low bit; Get32Bytes writes the
+        // big-endian x directly (4x bswap64) instead of a 32-byte reverse_copy.
+        shaIn[i][0] = 0x02 | (uint8_t)(p[i].y.bits64[0] & 1ULL);
+        p[i].x.Get32Bytes(&shaIn[i][1]);
     }
 
-    sha256avx2_8B_33(shaIn, digest);
-    ripemd160avx2::ripemd160avx2_32_fast(digest, outHash);
+    hash160_pubkey_8(shaIn, outHash);
 }
 
 static void printUsage(const char* prog)

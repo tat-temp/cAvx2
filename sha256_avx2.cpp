@@ -1,4 +1,5 @@
 #include "sha256_avx2.h"
+#include "ripemd160_avx2.h"
 #include <immintrin.h>
 #include <string.h>
 #include <stdint.h>
@@ -191,7 +192,9 @@ static inline void sha_transpose8x8(__m256i r[8]) {
     r[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
 }
 
-void sha256avx2_8B_33(const uint8_t in[8][64], uint8_t out[8][32]) {
+// SHA-256 core: one 64-byte block per lane (33-byte-pubkey layout), producing
+// the 8 state words as per-word lane vectors (native order, pre output-bswap).
+static void sha256_8way_block33(const uint8_t in[8][64], __m256i state[8]) {
     using namespace _sha256avx2;
 
     static const uint32_t K[64] = {
@@ -243,7 +246,6 @@ void sha256avx2_8B_33(const uint8_t in[8][64], uint8_t out[8][32]) {
             _mm256_add_epi32(s1(W[t - 2]), W[t - 7]),
             _mm256_add_epi32(s0(W[t - 15]), W[t - 16]));
 
-    __m256i state[8];
     Initialize(state);
     __m256i a = state[0], b = state[1], c = state[2], d = state[3];
     __m256i e = state[4], f = state[5], g = state[6], h = state[7];
@@ -262,13 +264,39 @@ void sha256avx2_8B_33(const uint8_t in[8][64], uint8_t out[8][32]) {
     state[5] = _mm256_add_epi32(state[5], f);
     state[6] = _mm256_add_epi32(state[6], g);
     state[7] = _mm256_add_epi32(state[7], h);
+}
+
+static inline __m256i sha_bswap_mask() {
+    return _mm256_setr_epi8(
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+        3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+}
+
+void sha256avx2_8B_33(const uint8_t in[8][64], uint8_t out[8][32]) {
+    __m256i state[8];
+    sha256_8way_block33(in, state);
 
     // Digest store: byte-swap each state word to big-endian, transpose back to
     // per-lane layout, write 32 bytes per output.
+    const __m256i BSWAP = sha_bswap_mask();
     for (int i = 0; i < 8; ++i)
         state[i] = _mm256_shuffle_epi8(state[i], BSWAP);
     sha_transpose8x8(state);
     for (int i = 0; i < 8; ++i)
         _mm256_storeu_si256((__m256i*)out[i], state[i]);
+}
+
+void hash160_pubkey_8(const uint8_t in[8][64], uint8_t out[8][20]) {
+    __m256i state[8];
+    sha256_8way_block33(in, state);
+
+    // RIPEMD-160 input word k = bswap(SHA state word k). Feed straight into the
+    // RIPEMD core in registers: SHA's output transpose and RIPEMD's input
+    // transpose are inverses, so both are skipped (no digest buffer round-trip).
+    const __m256i BSWAP = sha_bswap_mask();
+    __m256i w[8];
+    for (int i = 0; i < 8; ++i)
+        w[i] = _mm256_shuffle_epi8(state[i], BSWAP);
+    ripemd160avx2::ripemd160_8way_words(w, out);
 }
 
