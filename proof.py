@@ -7,7 +7,6 @@ import time
 import sys
 import math
 import random
-import select
 from typing import List, Tuple, Optional, Set, Dict
 from ecdsa import SECP256k1, SigningKey
 
@@ -109,11 +108,10 @@ def run_cyclone_and_watch(
         assert p.stdout is not None
         for line in p.stdout:
             if match_marker in line:
+                # The match block ("Private Key", "Public Key", ...) is already
+                # buffered; read it with bounded readline calls. Avoid select() —
+                # on Windows it does not work on subprocess pipe fds.
                 for _ in range(20):
-                    fd = p.stdout.fileno()
-                    rlist, _, _ = select.select([fd], [], [], 0.2)
-                    if not rlist:
-                        break
                     nxt = p.stdout.readline()
                     if not nxt:
                         break
@@ -121,7 +119,7 @@ def run_cyclone_and_watch(
                         parts = nxt.split(":", 1)
                         if len(parts) > 1:
                             found_priv = parts[1].strip()
-                            break
+                        break
                 p.terminate()
                 try:
                     p.wait(timeout=5)

@@ -30,9 +30,13 @@
 #define ALIGN32 __attribute__((aligned(32)))
 #endif
 
-static constexpr int    CPU_GROUP_SIZE = 4096;
-static constexpr int    HASH_BATCH_SIZE = 8;
+static constexpr int    CPU_GROUP_SIZE = 4096;   // default group size (override with -g)
+static constexpr int    HASH_BATCH_SIZE = 8;     // AVX2 lane count, fixed
 static constexpr double STATUS_INTERVAL_SEC = 5.0;
+
+// Sink for --skip-hash (EC-only) mode: keeps the generated points "live" so the
+// optimizer cannot delete the point math we are trying to benchmark.
+static volatile uint64_t g_sink = 0;
 
 static inline std::string bytesToHex(const uint8_t* data, size_t len)
 {
@@ -171,12 +175,6 @@ static inline std::string intToHex(const Int& v)
     Int t; t.Set((Int*)&v); return t.GetBase16();
 }
 
-static inline bool intGreater(const Int& a, const Int& b)
-{
-    std::string ha = ((Int&)a).GetBase16(), hb = ((Int&)b).GetBase16();
-    return ha.size() != hb.size() ? ha.size() > hb.size() : ha > hb;
-}
-
 static inline bool isEven(const Int& n) { return n.IsEven(); }
 
 static inline std::string intXToHex64(const Int& x)
@@ -192,51 +190,50 @@ static inline std::string pointToCompressedHex(const Point& p)
     return (isEven(p.y) ? "02" : "03") + intXToHex64(p.x);
 }
 
-static inline void pointToCompressedBin2(const Point& p, uint8_t out[33])
-{
-    out[0] = isEven(p.y) ? 0x02 : 0x03;
-    uint8_t* pSrc = ((Int*)&p.x)->GetBytes();
-    std::reverse_copy(pSrc, pSrc + 32, &out[1]);
-}
-
 static void computeHash160BatchBinSingle3(
     Point* p,
     uint8_t outHash[][20])
 {
-    uint8_t shaIn[HASH_BATCH_SIZE][64];
-
-    std::memset(&shaIn, 0, HASH_BATCH_SIZE * 64);
+    // Persistent per-thread buffers. The SHA padding bytes [33..35] are constant
+    // across calls, so write them once; each call only refreshes the 33 pubkey
+    // bytes [0..32]. The specialized single-block hashes supply every other
+    // padding/length word internally.
+    alignas(32) static thread_local uint8_t shaIn[HASH_BATCH_SIZE][64];
+    alignas(32) static thread_local uint8_t digest[HASH_BATCH_SIZE][32];
+    static thread_local bool init = false;
+    if (!init) {
+        for (int i = 0; i < HASH_BATCH_SIZE; i++) {
+            shaIn[i][33] = 0x80;
+            shaIn[i][34] = 0x00;
+            shaIn[i][35] = 0x00;
+        }
+        init = true;
+    }
 
     for (int i = 0; i < HASH_BATCH_SIZE; i++)
     {
         shaIn[i][0] = isEven(&p[i].y) ? 0x02 : 0x03;
         uint8_t* pSrc = (&p[i].x)->GetBytes();
         std::reverse_copy(pSrc, pSrc + 32, &shaIn[i][1]);
-
-        shaIn[i][33] = 0x80;
-        shaIn[i][60] = uint8_t((33 * 8) >> 24);
-        shaIn[i][61] = uint8_t((33 * 8) >> 16);
-        shaIn[i][62] = uint8_t((33 * 8) >> 8);
-        shaIn[i][63] = uint8_t((33 * 8));
     }
 
-    sha256avx2_8B(
-        (const uint8_t*)&shaIn[0], (const uint8_t*)&shaIn[1], (const uint8_t*)&shaIn[2], (const uint8_t*)&shaIn[3], (const uint8_t*)&shaIn[4], (const uint8_t*)&shaIn[5], (const uint8_t*)&shaIn[6], (const uint8_t*)&shaIn[7],
-        (uint8_t*)&shaIn[0], (uint8_t*)&shaIn[1], (uint8_t*)&shaIn[2], (uint8_t*)&shaIn[3], (uint8_t*)&shaIn[4], (uint8_t*)&shaIn[5], (uint8_t*)&shaIn[6], (uint8_t*)&shaIn[7]);
-
-    ripemd160avx2::ripemd160avx2_32(
-        (unsigned char*)&shaIn[0], (unsigned char*)&shaIn[1], (unsigned char*)&shaIn[2],
-        (unsigned char*)&shaIn[3], (unsigned char*)&shaIn[4], (unsigned char*)&shaIn[5],
-        (unsigned char*)&shaIn[6], (unsigned char*)&shaIn[7],
-        outHash[0], outHash[1], outHash[2], outHash[3], outHash[4], outHash[5], outHash[6], outHash[7]);
-
+    sha256avx2_8B_33(shaIn, digest);
+    ripemd160avx2::ripemd160avx2_32_fast(digest, outHash);
 }
 
 static void printUsage(const char* prog)
 {
-    std::cerr << "Usage: " << prog
-        << " -a <Base58_P2PKH> -r <START:END>"
-        << " [-t <THREADS>]\n";
+    std::cerr
+        << "Usage: " << prog << " -a <Base58_P2PKH> -r <START:END> [options]\n"
+        << "  -a <addr>       target P2PKH address (optional in benchmark mode)\n"
+        << "  -r <START:END>  hex private-key range (optional in benchmark mode)\n"
+        << "  -t <threads>    worker threads (default: all logical CPUs)\n"
+        << "  -g <size>       CPU group size, multiple of " << HASH_BATCH_SIZE
+        << " (default " << CPU_GROUP_SIZE << "); cache/throughput tuning\n"
+        << "  -b <seconds>    benchmark: run for <seconds> then report Mkeys/s\n"
+        << "                  (no real target needed) and exit\n"
+        << "  --skip-hash     skip SHA-256/RIPEMD-160 (EC point-gen only) to\n"
+        << "                  profile the EC vs hashing split\n";
 }
 
 static std::string formatElapsedTime(double sec)
@@ -282,7 +279,11 @@ int main(int argc, char* argv[])
 {
     bool aOK = false, rOK = false, tOK = false;
 
-    int  userThreads = 0;
+    int    userThreads  = 0;
+    int    groupSize    = CPU_GROUP_SIZE;
+    bool   benchmark    = false;
+    double benchSeconds = 10.0;
+    bool   skipHash     = false;
 
     std::string targetAddress, rangeStr;
     std::vector<uint8_t> targetHash160;
@@ -301,9 +302,32 @@ int main(int argc, char* argv[])
                 std::cerr << "-t must be >0\n"; return 1;
             }
         }
+        else if (!std::strcmp(argv[i], "-g") && i + 1 < argc) {
+            groupSize = std::stoi(argv[++i]);
+            if (groupSize < HASH_BATCH_SIZE || groupSize % HASH_BATCH_SIZE != 0) {
+                std::cerr << "-g must be a positive multiple of "
+                          << HASH_BATCH_SIZE << "\n";
+                return 1;
+            }
+        }
+        else if ((!std::strcmp(argv[i], "-b") || !std::strcmp(argv[i], "--benchmark"))
+                 && i + 1 < argc) {
+            benchSeconds = std::stod(argv[++i]); benchmark = true;
+            if (benchSeconds <= 0.0) { std::cerr << "-b must be >0\n"; return 1; }
+        }
+        else if (!std::strcmp(argv[i], "--skip-hash")) {
+            skipHash = true;
+        }
         else {
             printUsage(argv[0]); return 1;
         }
+    }
+
+    // Benchmark mode: a real target/range are optional. Default to a wide range
+    // and an all-zero (never-match) target so we time the pipeline, not a find.
+    if (benchmark) {
+        if (!rOK) { rangeStr = "8000000000000000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"; rOK = true; }
+        if (!aOK) { targetHash160.assign(20, 0x00); targetAddress = "(benchmark)"; aOK = true; }
     }
     if (!aOK || !rOK) { printUsage(argv[0]); return 1; }
 
@@ -353,15 +377,16 @@ int main(int argc, char* argv[])
     double             globalElapsed = 0.0, mkeys = 0.0;
     auto tStart = std::chrono::high_resolution_clock::now();
     auto lastStat = tStart;
-    const int hLength = (CPU_GROUP_SIZE / 2 - 1);
-    bool        matchFound = false;
+    const int hLength = (groupSize / 2 - 1);
+    bool          matchFound = false;
+    volatile bool benchStop  = false;
     std::string foundPriv, foundPub, foundWIF;
 
     Secp256K1 secp;
     secp.Init();
 
 #pragma omp parallel num_threads(numCPUs) \
-    shared(globalChecked,globalElapsed,mkeys,matchFound, \
+    shared(globalChecked,globalElapsed,mkeys,matchFound,benchStop, \
            foundPriv,foundPub,foundWIF, \
            tStart,lastStat)
     {
@@ -370,14 +395,14 @@ int main(int argc, char* argv[])
         Int priv = hexToInt(g_threadRanges[tid].startHex);
         Int privEnd = hexToInt(g_threadRanges[tid].endHex);       
 
-        Int halfGroupSize; halfGroupSize.SetInt32(CPU_GROUP_SIZE / 2);
+        Int halfGroupSize; halfGroupSize.SetInt32(groupSize / 2);
         Int privStartMiddleGroup = priv; privStartMiddleGroup.Add(&halfGroupSize);
-        
+
         Point startP = secp.ComputePublicKey(&privStartMiddleGroup);
 
-        std::vector<Int> dx(CPU_GROUP_SIZE / 2 + 1);
-        IntGroup grp(CPU_GROUP_SIZE / 2 + 1);
-        Point pts[CPU_GROUP_SIZE];
+        std::vector<Int> dx(groupSize / 2 + 1);
+        IntGroup grp(groupSize / 2 + 1);
+        std::vector<Point> pts(groupSize);
 
         grp.Set(dx.data());
 
@@ -388,7 +413,7 @@ int main(int argc, char* argv[])
         Point pp;
         Point pn;
 
-        Point Gn[CPU_GROUP_SIZE / 2];
+        std::vector<Point> Gn(groupSize / 2);
         Point _2Gn;
 
         // Compute Generator table G[n] = (n+1)*G
@@ -396,22 +421,34 @@ int main(int argc, char* argv[])
         Gn[0] = g;
         g = secp.DoubleDirect(g);
         Gn[1] = g;
-        for (int i = 2; i < CPU_GROUP_SIZE / 2; i++) {
+        for (int i = 2; i < groupSize / 2; i++) {
             g = secp.AddDirect(g, secp.G);
             Gn[i] = g;
         }
-        // _2Gn = CPU_GRP_SIZE*G
-        _2Gn = secp.DoubleDirect(Gn[CPU_GROUP_SIZE / 2 - 1]);
+        // _2Gn = groupSize*G
+        _2Gn = secp.DoubleDirect(Gn[groupSize / 2 - 1]);
 
         ALIGN32 uint8_t hashRes[HASH_BATCH_SIZE][20];
 
         __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(targetHash160.data()));
 
-        while (!matchFound) {
+        while (!matchFound && !benchStop) {
             /*{
                 std::cout << intToHex(priv) << ":" << intToHex(privEnd) << "\n";
             }*/
             if (priv.IsGreater((Int*)&privEnd)) break;
+
+            // Clamp the final block so we never test (or count) keys past privEnd.
+            uint64_t validCount = (uint64_t)groupSize;
+            {
+                Int blockLast = priv;
+                blockLast.Add((uint64_t)(groupSize - 1));
+                if (blockLast.IsGreater((Int*)&privEnd)) {
+                    Int rem = privEnd;
+                    rem.Sub(&priv);                       // 0 <= rem < groupSize
+                    validCount = (uint64_t)rem.GetInt32() + 1ULL;
+                }
+            }
 
             int j;
 
@@ -423,7 +460,7 @@ int main(int argc, char* argv[])
 
             grp.ModInv();
 
-            pts[CPU_GROUP_SIZE / 2] = startP;
+            pts[groupSize / 2] = startP;
 
             for (j = 0; j < hLength; j++) {
                 pp = startP;
@@ -459,8 +496,8 @@ int main(int argc, char* argv[])
                 pn.y.ModMulK1(&_s);
                 pn.y.ModAdd(&Gn[j].y);          // ry = - p2.y - s*(ret.x-p2.x);
 
-                pts[CPU_GROUP_SIZE / 2 + (j + 1)] = pp;
-                pts[CPU_GROUP_SIZE / 2 - (j + 1)] = pn;
+                pts[groupSize / 2 + (j + 1)] = pp;
+                pts[groupSize / 2 - (j + 1)] = pn;
             }
 
             // First point (startP - (GRP_SZIE/2)*G)
@@ -517,13 +554,15 @@ int main(int argc, char* argv[])
             //    }
             //}
 
-            for (int i = 0; i < CPU_GROUP_SIZE; i += HASH_BATCH_SIZE) {
+          if (!skipHash) {
+            for (int i = 0; i < groupSize; i += HASH_BATCH_SIZE) {
                 computeHash160BatchBinSingle3(
-                    ((Point*)&pts) + i,
+                    pts.data() + i,
                     hashRes);
 
                 // Results check
                 for (int j = 0; j < HASH_BATCH_SIZE; j++) {
+                    if ((uint64_t)(i + j) >= validCount) break;
                     /*{
                         Int i;
                         i.Set32Bytes(hashRes[j]);
@@ -555,17 +594,28 @@ int main(int argc, char* argv[])
                     }
                 }
             }
+          } else {
+            // EC-only profiling: touch every point so the optimizer keeps the
+            // point math we are benchmarking.
+            uint64_t acc = 0;
+            for (int i = 0; i < groupSize; i++) acc ^= pts[i].x.bits64[0];
+            g_sink ^= acc;
+          }
 
             {
-                priv.Add((uint64_t)CPU_GROUP_SIZE);
+                priv.Add((uint64_t)groupSize);
             }
 
 #pragma omp atomic
-            globalChecked += CPU_GROUP_SIZE;
+            globalChecked += validCount;
 
             if (tid == 0)
             {
                 auto now = std::chrono::high_resolution_clock::now();
+
+                if (benchmark &&
+                    std::chrono::duration<double>(now - tStart).count() >= benchSeconds)
+                    benchStop = true;
 
                 if (std::chrono::duration<double>(now - lastStat).count()
                     >= STATUS_INTERVAL_SEC)
@@ -590,6 +640,20 @@ int main(int argc, char* argv[])
                 }
             }
         }
+    }
+
+    if (benchmark) {
+        double el = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - tStart).count();
+        double rate = el > 0.0 ? globalChecked / el / 1e6 : 0.0;
+        std::cout << "\n========== BENCHMARK RESULT ==========\n"
+            << "Threads     : " << numCPUs << "\n"
+            << "Group size  : " << groupSize << "\n"
+            << "Hashing     : " << (skipHash ? "OFF (EC point-gen only)" : "ON") << "\n"
+            << "Keys done   : " << globalChecked << "\n"
+            << "Elapsed     : " << std::fixed << std::setprecision(2) << el << " s\n"
+            << "Throughput  : " << std::fixed << std::setprecision(2) << rate << " Mkeys/s\n";
+        return 0;
     }
 
     if (!matchFound) {

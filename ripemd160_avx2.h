@@ -19,6 +19,11 @@ void ripemd160avx2_32(
     unsigned char *d0, unsigned char *d1, unsigned char *d2, unsigned char *d3,
     unsigned char *d4, unsigned char *d5, unsigned char *d6, unsigned char *d7);
 
+// Specialized single-block RIPEMD-160 of 8 x 32-byte inputs (hot path).
+// in[i]  : 32-byte message (a SHA-256 digest); read-only, padding is implicit.
+// out[i] : 20-byte digest.
+void ripemd160avx2_32_fast(const uint8_t in[8][32], uint8_t out[8][20]);
+
 }  // namespace ripemd160avx2
 
 #endif  // RIPEMD160_AVX2_H
