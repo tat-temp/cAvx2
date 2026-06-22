@@ -26,8 +26,13 @@ case "$ARCH" in
     # on CPUs that have it (no effect on CPUs that don't).
     ARCH_FLAGS="-march=native -mno-avx512f -mno-avx512vl -mno-avx512dq -mno-avx512bw -mno-avx512cd"
     DEF_OUT="Cyclone_native" ;;
+  adx)
+    # Baseline ISA + the hand-written dual-carry-chain (mulx/adcx/adox) field
+    # multiply (Phase 2). A/B this against `baseline`.
+    ARCH_FLAGS="-mavx2 -mbmi2 -madx -DFIELD_ADX"
+    DEF_OUT="Cyclone_adx" ;;
   *)
-    echo "usage: $0 [baseline|native] [output-name]" >&2; exit 2 ;;
+    echo "usage: $0 [baseline|native|adx] [output-name]" >&2; exit 2 ;;
 esac
 OUT="${OUT:-$DEF_OUT}"
 
