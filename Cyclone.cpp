@@ -232,7 +232,9 @@ static void printUsage(const char* prog)
         << "  -b <seconds>    benchmark: run for <seconds> then report Mkeys/s\n"
         << "                  (no real target needed) and exit\n"
         << "  --skip-hash     skip SHA-256/RIPEMD-160 (EC point-gen only) to\n"
-        << "                  profile the EC vs hashing split\n";
+        << "                  profile the EC vs hashing split\n"
+        << "  --ilp <0-8>     EC point-loop interleave width (0 = original loop,\n"
+        << "                  N>0 = interleave 2xN independent point chains)\n";
 }
 
 static std::string formatElapsedTime(double sec)
@@ -283,6 +285,7 @@ int main(int argc, char* argv[])
     bool   benchmark    = false;
     double benchSeconds = 10.0;
     bool   skipHash     = false;
+    int    ilpWidth     = 0;   // 0 = original point loop; >0 = interleave width
 
     std::string targetAddress, rangeStr;
     std::vector<uint8_t> targetHash160;
@@ -316,6 +319,12 @@ int main(int argc, char* argv[])
         }
         else if (!std::strcmp(argv[i], "--skip-hash")) {
             skipHash = true;
+        }
+        else if (!std::strcmp(argv[i], "--ilp") && i + 1 < argc) {
+            ilpWidth = std::stoi(argv[++i]);
+            if (ilpWidth < 0 || ilpWidth > 8) {
+                std::cerr << "--ilp must be 0..8 (0 = original loop)\n"; return 1;
+            }
         }
         else {
             printUsage(argv[0]); return 1;
@@ -412,6 +421,13 @@ int main(int argc, char* argv[])
         Point pp;
         Point pn;
 
+        // Interleave scratch for the --ilp point loop: MAXW independent (+G) and
+        // (-G) chains processed in lockstep to hide field-multiply latency.
+        static const int MAXW = 8;
+        Int dyf[MAXW], sf[MAXW], pf[MAXW];
+        Int dyb[MAXW], sb[MAXW], pb[MAXW];
+        Point ppA[MAXW], pnA[MAXW];
+
         std::vector<Point> Gn(groupSize / 2);
         Point _2Gn;
 
@@ -461,6 +477,7 @@ int main(int argc, char* argv[])
 
             pts[groupSize / 2] = startP;
 
+          if (ilpWidth <= 0) {
             for (j = 0; j < hLength; j++) {
                 pp = startP;
                 pn = startP;
@@ -498,6 +515,49 @@ int main(int argc, char* argv[])
                 pts[groupSize / 2 + (j + 1)] = pp;
                 pts[groupSize / 2 - (j + 1)] = pn;
             }
+          } else {
+            // --- ILP: process 2*W independent chains in lockstep so the
+            //     dependent field-multiply latencies overlap. Each step is the
+            //     same op for all W forward (+G) and W backward (-G) points.
+            int W = ilpWidth; if (W > MAXW) W = MAXW;
+            for (int jb = 0; jb < hLength; jb += W) {
+                int w = (hLength - jb < W) ? (hLength - jb) : W;
+
+                for (int k = 0; k < w; k++) { int jx = jb + k;
+                    dyf[k].ModSub(&Gn[jx].y, &startP.y);                       // +G: dy
+                    dyb[k].Set(&Gn[jx].y); dyb[k].ModNeg(); dyb[k].ModSub(&startP.y); // -G: dy
+                }
+                for (int k = 0; k < w; k++) { int jx = jb + k;
+                    sf[k].ModMulK1(&dyf[k], &dx[jx]);                          // s = dy * dxinv
+                    sb[k].ModMulK1(&dyb[k], &dx[jx]);
+                }
+                for (int k = 0; k < w; k++) {
+                    pf[k].ModSquareK1(&sf[k]);                                 // s^2
+                    pb[k].ModSquareK1(&sb[k]);
+                }
+                for (int k = 0; k < w; k++) { int jx = jb + k;
+                    ppA[k].x.Set(&startP.x); ppA[k].x.ModNeg();
+                    ppA[k].x.ModAdd(&pf[k]); ppA[k].x.ModSub(&Gn[jx].x);       // rx = s^2 - x1 - x2
+                    pnA[k].x.Set(&startP.x); pnA[k].x.ModNeg();
+                    pnA[k].x.ModAdd(&pb[k]); pnA[k].x.ModSub(&Gn[jx].x);
+                }
+                for (int k = 0; k < w; k++) { int jx = jb + k;
+                    ppA[k].y.ModSub(&Gn[jx].x, &ppA[k].x);                     // x2 - rx
+                    pnA[k].y.ModSub(&Gn[jx].x, &pnA[k].x);
+                }
+                for (int k = 0; k < w; k++) {
+                    ppA[k].y.ModMulK1(&sf[k]);                                 // s*(x2 - rx)
+                    pnA[k].y.ModMulK1(&sb[k]);
+                }
+                for (int k = 0; k < w; k++) { int jx = jb + k;
+                    ppA[k].y.ModSub(&Gn[jx].y);                                // ry = s*(x2-rx) - y2
+                    pnA[k].y.ModAdd(&Gn[jx].y);                                // ry = s*(x2-rx) + y2
+                    pts[groupSize / 2 + (jx + 1)] = ppA[k];
+                    pts[groupSize / 2 - (jx + 1)] = pnA[k];
+                }
+            }
+            j = hLength;
+          }
 
             // First point (startP - (GRP_SZIE/2)*G)
             pn = startP;
@@ -649,6 +709,7 @@ int main(int argc, char* argv[])
             << "Threads     : " << numCPUs << "\n"
             << "Group size  : " << groupSize << "\n"
             << "Hashing     : " << (skipHash ? "OFF (EC point-gen only)" : "ON") << "\n"
+            << "ILP width   : " << ilpWidth << (ilpWidth ? "" : " (original loop)") << "\n"
             << "Keys done   : " << globalChecked << "\n"
             << "Elapsed     : " << std::fixed << std::setprecision(2) << el << " s\n"
             << "Throughput  : " << std::fixed << std::setprecision(2) << rate << " Mkeys/s\n";
