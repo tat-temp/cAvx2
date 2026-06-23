@@ -244,8 +244,8 @@ static void printUsage(const char* prog)
         << "                  (no real target needed) and exit\n"
         << "  --skip-hash     skip SHA-256/RIPEMD-160 (EC point-gen only) to\n"
         << "                  profile the EC vs hashing split\n"
-        << "  --ilp <0-16>    EC point-loop interleave width (0 = original loop,\n"
-        << "                  N>0 = interleave 2xN independent point chains)\n"
+        << "  --ilp <0-16>    EC point-loop interleave width (default 16; 0 =\n"
+        << "                  original loop, N>0 = interleave 2xN point chains)\n"
         << "  --selftest [N]  validate field ModMulK1/ModSquareK1 against an\n"
         << "                  independent full-multiply/division oracle and exit\n";
 }
@@ -393,7 +393,8 @@ int main(int argc, char* argv[])
     bool   benchmark    = false;
     double benchSeconds = 10.0;
     bool   skipHash     = false;
-    int    ilpWidth     = 0;   // 0 = original point loop; >0 = interleave width
+    int    ilpWidth     = 16;  // default: interleave 2x16 point chains (+4.6% @ -t16
+                               // vs the original loop, measured); 0 = original loop
     bool     runSelftest   = false;
     uint64_t selftestIters = 200000;
 
