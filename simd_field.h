@@ -90,12 +90,17 @@ static inline __m256i sf_carry(__m256i* d, int n, __m256i mask) {
 }
 
 // Reduce a raw 17-limb convolution d[0..16] (d[17] must be 0) to a normalized
-// fe4 < 2^256.  Shared by multiply and square.
+// fe4 < 2^256.  Shared by multiply and square.  Three carry sweeps: normalize
+// the product, fold the high half (2^261 = 32R), then fold the leftover carry
+// (32R) AND the 2^256 cleanup (limb-8 bits >=256, via R = 2^32+977) together in
+// one final settle.  Every value fed to vpmuludq stays < 2^32 for <2^256 inputs.
 static inline void sf_reduce(__m256i* d, fe4& out) {
     const __m256i m29     = _mm256_set1_epi64x(SF_M29);
     const __m256i c31264  = _mm256_set1_epi64x(31264);
+    const __m256i m24     = _mm256_set1_epi64x(SF_M24);
+    const __m256i c977    = _mm256_set1_epi64x(977);
 
-    sf_carry(d, 18, m29);                 // normalize the full product (each < 2^29)
+    sf_carry(d, 18, m29);                  // sweep 1: full product normalized (<2^29)
 
     // fold the high half (limbs 9..17, weight 2^261 = 32R) into acc[0..9]
     __m256i acc[10];
@@ -105,26 +110,21 @@ static inline void sf_reduce(__m256i* d, fe4& out) {
         acc[m]     = SF_ADD(acc[m],     SF_MUL(d[9 + m], c31264)); // *31264
         acc[m + 1] = SF_ADD(acc[m + 1], SF_SHL(d[9 + m], 8));      // *2^37 -> limb+1 <<8
     }
-    // collapse limb 9 (weight 2^261 = 32R) into 0..1
-    acc[0] = SF_ADD(acc[0], SF_MUL(acc[9], c31264));
+    acc[0] = SF_ADD(acc[0], SF_MUL(acc[9], c31264));  // collapse limb 9 (32R)
     acc[1] = SF_ADD(acc[1], SF_SHL(acc[9], 8));
 
-    // normalize 0..8; fold the carry out of limb 8 (weight 2^261 = 32R)
-    __m256i cc = sf_carry(acc, 9, m29);
+    __m256i cc = sf_carry(acc, 9, m29);    // sweep 2: -> cc = carry out of limb 8 (>=2^261)
+
+    // fold cc (32R) and the 2^256 cleanup together, then one settle sweep
     acc[0] = SF_ADD(acc[0], SF_MUL(cc, c31264));
     acc[1] = SF_ADD(acc[1], SF_SHL(cc, 8));
-    sf_carry(acc, 9, m29);
+    __m256i hi = SF_SHR(acc[8], 24);       // limb-8 bits >=256 -> coeff of 2^256 = R
+    acc[8] = SF_AND(acc[8], m24);
+    acc[0] = SF_ADD(acc[0], SF_MUL(hi, c977)); // hi*977 at limb 0
+    acc[1] = SF_ADD(acc[1], SF_SHL(hi, 3));    // hi*2^32 at limb 1 (<<3)
 
-    // final 2^256 cleanup: fold limb-8 bits >=256 via R = 2^32 + 977
-    const __m256i m24  = _mm256_set1_epi64x(SF_M24);
-    const __m256i c977 = _mm256_set1_epi64x(977);
-    for (int pass = 0; pass < 2; pass++) {
-        __m256i hi = SF_SHR(acc[8], 24);   // bits 256.. -> coeff of 2^256 = R
-        acc[8] = SF_AND(acc[8], m24);
-        acc[0] = SF_ADD(acc[0], SF_MUL(hi, c977)); // hi*977 at limb 0
-        acc[1] = SF_ADD(acc[1], SF_SHL(hi, 3));    // hi*2^32 at limb 1 (<<3)
-        sf_carry(acc, 9, m29);
-    }
+    sf_carry(acc, 9, m29);                 // sweep 3: settle; value < 2^256
+
     for (int k = 0; k < 9; k++) out.l[k] = acc[k];
 }
 
