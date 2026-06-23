@@ -31,8 +31,17 @@ case "$ARCH" in
     # multiply (Phase 2). A/B this against `baseline`.
     ARCH_FLAGS="-mavx2 -mbmi2 -madx -DFIELD_ADX"
     DEF_OUT="Cyclone_adx" ;;
+  fused)
+    # Baseline ISA + fused hash-in-point-loop (Tier 2.3): generate points in
+    # FUSE_BLOCK-sized sub-blocks and hash each block while it is still L1-hot,
+    # instead of buffering the whole group and reading the ~480 KB pts[] back.
+    # Sweep the block size with e.g. `FUSE_BLOCK=512 ./build.sh fused Cyclone_f512`.
+    # A/B this against `baseline`.
+    FB="${FUSE_BLOCK:-256}"
+    ARCH_FLAGS="-mavx2 -mbmi2 -madx -DFUSED_HASH -DFUSE_BLOCK=${FB}"
+    DEF_OUT="Cyclone_fused" ;;
   *)
-    echo "usage: $0 [baseline|native|adx] [output-name]" >&2; exit 2 ;;
+    echo "usage: $0 [baseline|native|adx|fused] [output-name]" >&2; exit 2 ;;
 esac
 OUT="${OUT:-$DEF_OUT}"
 

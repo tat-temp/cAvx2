@@ -35,6 +35,16 @@ static constexpr int    CPU_GROUP_SIZE = 4096;   // default group size (override
 static constexpr int    HASH_BATCH_SIZE = 8;     // AVX2 lane count, fixed
 static constexpr double STATUS_INTERVAL_SEC = 5.0;
 
+// Fused-hash sub-block (Tier 2.3, FUSED_HASH builds only): how many freshly
+// generated points are buffered and hashed as a unit. Small enough to stay
+// L1-resident, large enough to feed the AVX2 hash kernel many back-to-back
+// 8-lane calls. Override at build time with -DFUSE_BLOCK=N (multiple of 8).
+#ifndef FUSE_BLOCK
+#define FUSE_BLOCK 256
+#endif
+static_assert(FUSE_BLOCK % HASH_BATCH_SIZE == 0,
+              "FUSE_BLOCK must be a multiple of HASH_BATCH_SIZE");
+
 // Sink for --skip-hash (EC-only) mode: keeps the generated points "live" so the
 // optimizer cannot delete the point math we are trying to benchmark.
 static volatile uint64_t g_sink = 0;
@@ -525,7 +535,9 @@ int main(int argc, char* argv[])
 
         std::vector<Int> dx(groupSize / 2 + 1);
         IntGroup grp(groupSize / 2 + 1);
+#ifndef FUSED_HASH
         std::vector<Point> pts(groupSize);
+#endif
 
         grp.Set(dx.data());
 
@@ -562,6 +574,70 @@ int main(int argc, char* argv[])
 
         __m128i target16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(targetHash160.data()));
 
+        // Hoisted out of the loop so the fused-hash lambdas below can capture it
+        // by reference; it is re-clamped at the top of every group.
+        uint64_t validCount = (uint64_t)groupSize;
+
+#ifdef FUSED_HASH
+        // --- Fused hash (Tier 2.3) ------------------------------------------
+        // Buffer FUSE_BLOCK freshly generated points in a small L1-resident
+        // array, hash that whole block, then move on -- instead of writing all
+        // `groupSize` points (~480 KB at the default -g) and reading the entire
+        // array straight back to hash it. This decouples the inversion batch
+        // (groupSize, kept large so ModInv stays cheap per key) from the hash
+        // working set (FUSE_BLOCK, kept small so points stay hot from generation
+        // to hashing). A 256-point block is ~30 KB (fits L1d) yet still feeds the
+        // AVX2 kernel 32 back-to-back 8-lane calls, so hash port utilization and
+        // SMT-shared-L2 pressure both win. emit() carries each point's key offset
+        // explicitly (the two-phase path derived it from the array index).
+        Point    hbuf[FUSE_BLOCK];        // rolling point buffer (L1-resident)
+        int      hidx[FUSE_BLOCK];        // each buffered point's key offset
+        int      hcnt  = 0;               // points currently buffered
+        uint64_t ecAcc = 0;               // EC-only (--skip-hash) DCE sink
+
+        auto flushHash = [&]() {
+            for (int base = 0; base < hcnt; base += HASH_BATCH_SIZE) {
+                computeHash160BatchBinSingle3(hbuf + base, hashRes);
+                int n = hcnt - base;
+                if (n > HASH_BATCH_SIZE) n = HASH_BATCH_SIZE;
+                for (int j = 0; j < n; j++) {
+                    if ((uint64_t)hidx[base + j] >= validCount) continue; // past privEnd
+                    __m128i cand16 = _mm_load_si128(
+                        reinterpret_cast<const __m128i*>(hashRes[j]));
+                    __m128i cmp = _mm_cmpeq_epi8(cand16, target16);
+                    if (_mm_movemask_epi8(cmp) == 0xFFFF &&
+                        std::memcmp(hashRes[j], targetHash160.data(), 20) == 0) {
+#pragma omp critical(full_match)
+                        {
+                            if (!matchFound) {
+                                matchFound = true;
+                                Int mPriv = priv;
+                                Int off; off.SetInt32(hidx[base + j]);
+                                mPriv.Add(&off);
+                                foundPriv = padHexTo64(intToHex(mPriv));
+                                foundPub  = pointToCompressedHex(hbuf[base + j]);
+                                foundWIF  = P2PKHDecoder::compute_wif(foundPriv, true);
+                            }
+                        }
+                    }
+                }
+            }
+            hcnt = 0;
+        };
+
+        auto emit = [&](const Point& P, int idx) {
+            if (skipHash) { ecAcc ^= P.x.bits64[0]; return; }
+            hbuf[hcnt] = P;
+            hidx[hcnt] = idx;
+            if (++hcnt == FUSE_BLOCK) flushHash();
+        };
+#else
+        // Two-phase path: emit() just stores into the full pts[] array, which is
+        // hashed in a trailing pass. Inlines to a plain `pts[idx] = P` at -O3,
+        // so the baseline binary is unchanged.
+        auto emit = [&](const Point& P, int idx) { pts[idx] = P; };
+#endif
+
         while (!matchFound && !benchStop) {
             /*{
                 std::cout << intToHex(priv) << ":" << intToHex(privEnd) << "\n";
@@ -569,7 +645,7 @@ int main(int argc, char* argv[])
             if (priv.IsGreater((Int*)&privEnd)) break;
 
             // Clamp the final block so we never test (or count) keys past privEnd.
-            uint64_t validCount = (uint64_t)groupSize;
+            validCount = (uint64_t)groupSize;
             {
                 Int blockLast = priv;
                 blockLast.Add((uint64_t)(groupSize - 1));
@@ -590,7 +666,7 @@ int main(int argc, char* argv[])
 
             grp.ModInv();
 
-            pts[groupSize / 2] = startP;
+            emit(startP, groupSize / 2);
 
           if (ilpWidth <= 0) {
             for (j = 0; j < hLength; j++) {
@@ -627,8 +703,8 @@ int main(int argc, char* argv[])
                 pn.y.ModMulK1(&_s);
                 pn.y.ModAdd(&Gn[j].y);          // ry = - p2.y - s*(ret.x-p2.x);
 
-                pts[groupSize / 2 + (j + 1)] = pp;
-                pts[groupSize / 2 - (j + 1)] = pn;
+                emit(pp, groupSize / 2 + (j + 1));
+                emit(pn, groupSize / 2 - (j + 1));
             }
           } else {
             // --- ILP: process 2*W independent chains in lockstep so the
@@ -667,8 +743,8 @@ int main(int argc, char* argv[])
                 for (int k = 0; k < w; k++) { int jx = jb + k;
                     ppA[k].y.ModSub(&Gn[jx].y);                                // ry = s*(x2-rx) - y2
                     pnA[k].y.ModAdd(&Gn[jx].y);                                // ry = s*(x2-rx) + y2
-                    pts[groupSize / 2 + (jx + 1)] = ppA[k];
-                    pts[groupSize / 2 - (jx + 1)] = pnA[k];
+                    emit(ppA[k], groupSize / 2 + (jx + 1));
+                    emit(pnA[k], groupSize / 2 - (jx + 1));
                 }
             }
             j = hLength;
@@ -691,7 +767,7 @@ int main(int argc, char* argv[])
             pn.y.ModMulK1(&_s);
             pn.y.ModAdd(&Gn[j].y);
 
-            pts[0] = pn;
+            emit(pn, 0);
 
             // Next start point (startP + GRP_SIZE*G)
             pp = startP;
@@ -728,6 +804,13 @@ int main(int argc, char* argv[])
             //    }
             //}
 
+#ifdef FUSED_HASH
+            // Full batches were already hashed inline by emit(); drain the tail,
+            // then (EC-only) publish the DCE sink and reset it for the next group.
+            flushHash();
+            if (skipHash) g_sink ^= ecAcc;
+            ecAcc = 0;
+#else
           if (!skipHash) {
             for (int i = 0; i < groupSize; i += HASH_BATCH_SIZE) {
                 computeHash160BatchBinSingle3(
@@ -737,11 +820,6 @@ int main(int argc, char* argv[])
                 // Results check
                 for (int j = 0; j < HASH_BATCH_SIZE; j++) {
                     if ((uint64_t)(i + j) >= validCount) break;
-                    /*{
-                        Int i;
-                        i.Set32Bytes(hashRes[j]);
-                        std::cout << "0 " << padHexTo64(intToHex(i)) << "\n";
-                    }*/
 
                     __m128i cand16 = _mm_load_si128(reinterpret_cast<const __m128i*>(hashRes[j]));
                     __m128i cmp = _mm_cmpeq_epi8(cand16, target16);
@@ -775,6 +853,7 @@ int main(int argc, char* argv[])
             for (int i = 0; i < groupSize; i++) acc ^= pts[i].x.bits64[0];
             g_sink ^= acc;
           }
+#endif
 
             {
                 priv.Add((uint64_t)groupSize);
