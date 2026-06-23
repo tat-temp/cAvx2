@@ -40,8 +40,17 @@ case "$ARCH" in
     FB="${FUSE_BLOCK:-256}"
     ARCH_FLAGS="-mavx2 -mbmi2 -madx -DFUSED_HASH -DFUSE_BLOCK=${FB}"
     DEF_OUT="Cyclone_fused" ;;
+  simdtest)
+    # Tier 3 gate: standalone bit-exactness + microbench for the 4-way AVX2
+    # field multiply (simd_field.h) vs the scalar ModMulK1. Not the searcher --
+    # builds ./simdtest. Run it (`./simdtest`) and read the speedup line: it is
+    # the GO/NO-GO for vectorizing the point loop.
+    ARCH_FLAGS="-mavx2 -mbmi2 -madx"
+    DEF_OUT="simdtest"
+    SRC_OVERRIDE="simd_test.cpp Int.cpp IntMod.cpp Point.cpp SECP256K1.cpp \
+Random.cpp IntGroup.cpp" ;;
   *)
-    echo "usage: $0 [baseline|native|adx|fused] [output-name]" >&2; exit 2 ;;
+    echo "usage: $0 [baseline|native|adx|fused|simdtest] [output-name]" >&2; exit 2 ;;
 esac
 OUT="${OUT:-$DEF_OUT}"
 
@@ -51,6 +60,7 @@ COMMON="-std=c++17 -O3 -funroll-loops -ftree-vectorize -fstrict-aliasing \
 
 SRC="Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp \
 ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp"
+SRC="${SRC_OVERRIDE:-$SRC}"
 
 set -x
 # shellcheck disable=SC2086
