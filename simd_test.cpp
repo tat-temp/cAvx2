@@ -97,7 +97,15 @@ static int correctness(uint64_t iters) {
     return fails == 0 ? 0 : 1;
 }
 
-// ---- microbench: 16 scalar muls vs 4 fe4 muls per iter, 16-wide ILP --------
+// ---- microbench: throttle-robust. Alternates scalar/simd in short bursts over
+// many rounds and reports the MEDIAN ratio, so a thermal ramp hits both equally
+// (the absolute Mop/s still drift on a throttling laptop; the ratio is stable).
+static uint64_t g_sink = 0;
+static double median(double* v, int n) {
+    for (int i = 1; i < n; i++) { double x = v[i]; int j = i - 1;
+        while (j >= 0 && v[j] > x) { v[j+1] = v[j]; j--; } v[j+1] = x; }
+    return (n & 1) ? v[n/2] : 0.5 * (v[n/2 - 1] + v[n/2]);
+}
 static void microbench() {
     using clk = std::chrono::steady_clock;
     std::mt19937_64 rng(12345);
@@ -106,40 +114,55 @@ static void microbench() {
                            x.bits64[3]=rng();x.bits64[4]=0;x.Mod(P); };
 
     const int K = 16;                 // 16-wide ILP, matches --ilp 16
-    const uint64_t ITERS = 4000000;   // 16 * ITERS = 64M field multiplies
+    const int ROUNDS = 15;
+    const uint64_t BURST = 250000;    // 16*BURST = 4M ops per measurement
+    double smul[ROUNDS], vmul[ROUNDS], ssq[ROUNDS], vsq[ROUNDS];
 
-    Int sa[K], sb[K];
-    for (int i = 0; i < K; i++) { rf(sa[i]); rf(sb[i]); }
-    fe4 fa[4], fb[4];
-    for (int g = 0; g < 4; g++) {
-        fa[g] = fe4_pack(sa[4*g+0].bits64, sa[4*g+1].bits64, sa[4*g+2].bits64, sa[4*g+3].bits64);
-        fb[g] = fe4_pack(sb[4*g+0].bits64, sb[4*g+1].bits64, sb[4*g+2].bits64, sb[4*g+3].bits64);
+    Int sa[K], sb[K]; fe4 fa[4], fb[4];
+    auto reinit = [&]() {             // fresh, equal starting state each measurement
+        for (int i = 0; i < K; i++) { rf(sa[i]); rf(sb[i]); }
+        for (int g = 0; g < 4; g++) {
+            fa[g] = fe4_pack(sa[4*g].bits64, sa[4*g+1].bits64, sa[4*g+2].bits64, sa[4*g+3].bits64);
+            fb[g] = fe4_pack(sb[4*g].bits64, sb[4*g+1].bits64, sb[4*g+2].bits64, sb[4*g+3].bits64);
+        }
+    };
+    auto secs = [](clk::time_point a, clk::time_point b){
+        return std::chrono::duration<double>(b - a).count(); };
+
+    for (int r = 0; r < ROUNDS; r++) {
+        reinit();
+        auto a0 = clk::now();
+        for (uint64_t it = 0; it < BURST; it++) for (int i = 0; i < K; i++) sa[i].ModMulK1(&sb[i]);
+        auto a1 = clk::now();
+        for (int i = 0; i < K; i++) g_sink ^= sa[i].bits64[0];
+        for (uint64_t it = 0; it < BURST; it++) for (int g = 0; g < 4; g++) fe4_mul(fa[g], fa[g], fb[g]);
+        auto a2 = clk::now();
+        for (int g = 0; g < 4; g++) { uint64_t w[4]; fe4_unpack_lane(fa[g],0,w); g_sink ^= w[0]; }
+        smul[r] = secs(a0, a1); vmul[r] = secs(a1, a2);
+
+        reinit();
+        auto b0 = clk::now();
+        for (uint64_t it = 0; it < BURST; it++) for (int i = 0; i < K; i++) sa[i].ModSquareK1(&sa[i]);
+        auto b1 = clk::now();
+        for (int i = 0; i < K; i++) g_sink ^= sa[i].bits64[0];
+        for (uint64_t it = 0; it < BURST; it++) for (int g = 0; g < 4; g++) fe4_sqr(fa[g], fa[g]);
+        auto b2 = clk::now();
+        for (int g = 0; g < 4; g++) { uint64_t w[4]; fe4_unpack_lane(fa[g],0,w); g_sink ^= w[0]; }
+        ssq[r] = secs(b0, b1); vsq[r] = secs(b1, b2);
     }
 
-    // scalar: sa[i] *= sb[i]
-    auto t0 = clk::now();
-    for (uint64_t it = 0; it < ITERS; it++)
-        for (int i = 0; i < K; i++) sa[i].ModMulK1(&sb[i]);
-    auto t1 = clk::now();
-    uint64_t ssink = 0; for (int i = 0; i < K; i++) ssink ^= sa[i].bits64[0];
-
-    // simd: fa[g] = fa[g] * fb[g]
-    auto t2 = clk::now();
-    for (uint64_t it = 0; it < ITERS; it++)
-        for (int g = 0; g < 4; g++) fe4_mul(fa[g], fa[g], fb[g]);
-    auto t3 = clk::now();
-    uint64_t vsink = 0;
-    for (int g = 0; g < 4; g++) { uint64_t w[4]; fe4_unpack_lane(fa[g], 0, w); vsink ^= w[0]; }
-
-    double sdt = std::chrono::duration<double>(t1 - t0).count();
-    double vdt = std::chrono::duration<double>(t3 - t2).count();
-    double muls = (double)ITERS * 16.0;
-    printf("\nmicrobench (%.0fM field-muls each, K=%d ILP)\n", muls / 1e6, K);
-    printf("  scalar ModMulK1 : %7.3f s   %8.1f Mmul/s\n", sdt, muls / sdt / 1e6);
-    printf("  simd   fe4_mul  : %7.3f s   %8.1f Mmul/s\n", vdt, muls / vdt / 1e6);
-    printf("  speedup (scalar_t / simd_t) : %.3fx   %s\n",
-           sdt / vdt, (sdt / vdt > 1.0) ? "[SIMD faster]" : "[SIMD slower]");
-    printf("  (sinks %llx %llx)\n", (unsigned long long)ssink, (unsigned long long)vsink);
+    double sm = median(smul,ROUNDS), vm = median(vmul,ROUNDS);
+    double sq = median(ssq,ROUNDS),  vq = median(vsq,ROUNDS);
+    double ops = (double)BURST * 16.0;
+    printf("\nmicrobench (median of %d rounds, alternated; %.0fM ops/measure, K=%d ILP)\n",
+           ROUNDS, ops/1e6, K);
+    printf("  mul : scalar %7.1f Mop/s | simd %7.1f Mop/s | speedup %.3fx  %s\n",
+           ops/sm/1e6, ops/vm/1e6, sm/vm, (sm/vm > 1.0) ? "[SIMD faster]" : "[SIMD slower]");
+    printf("  sqr : scalar %7.1f Mop/s | simd %7.1f Mop/s | speedup %.3fx  %s\n",
+           ops/sq/1e6, ops/vq/1e6, sq/vq, (sq/vq > 1.0) ? "[SIMD faster]" : "[SIMD slower]");
+    printf("  2mul+1sqr (point-loop mix)  : speedup %.3fx  %s\n",
+           (2*sm+sq)/(2*vm+vq), ((2*sm+sq)/(2*vm+vq) > 1.0) ? "[SIMD faster]" : "[SIMD slower]");
+    printf("  (sink %llx)\n", (unsigned long long)g_sink);
 }
 
 int main(int argc, char** argv) {
