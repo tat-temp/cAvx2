@@ -90,6 +90,31 @@ static int correctness(uint64_t iters) {
                 fails++;
             }
         }
+
+        // add / sub / neg (inputs a,b are magnitude 1)
+        fe4 fadd; fe4_add(fadd, fa, fb); fe4_normalize(fadd);
+        fe4 fsub; fe4_sub(fsub, fa, fb, 1); fe4_normalize(fsub);
+        fe4 fneg; fe4_neg(fneg, fa, 1); fe4_normalize(fneg);
+        for (int l = 0; l < 4; l++) {
+            Int refA; refA.ModAdd(&a[l], &b[l]); canon(refA);
+            Int refS; refS.ModSub(&a[l], &b[l]); canon(refS);
+            Int refN; refN.Set(&a[l]); refN.ModNeg(); canon(refN);
+            const fe4* fs[3] = {&fadd, &fsub, &fneg};
+            Int* rfs[3] = {&refA, &refS, &refN};
+            const char* tag[3] = {"ADD", "SUB", "NEG"};
+            for (int t = 0; t < 3; t++) {
+                uint64_t w[4]; fe4_unpack_lane(*fs[t], l, w);
+                Int got; setIntFrom4(got, w); canon(got);
+                checks++;
+                if (!got.IsEqual(rfs[t])) {
+                    if (fails < 6)
+                        fprintf(stderr, "%s MISMATCH lane %d\n  a  =%s\n  b  =%s\n  simd=%s\n  ref =%s\n",
+                            tag[t], l, a[l].GetBase16().c_str(), b[l].GetBase16().c_str(),
+                            got.GetBase16().c_str(), rfs[t]->GetBase16().c_str());
+                    fails++;
+                }
+            }
+        }
     }
     printf("simd field: %llu checks, %llu fail\n",
            (unsigned long long)checks, (unsigned long long)fails);
@@ -167,6 +192,7 @@ static void microbench() {
 
 int main(int argc, char** argv) {
     Secp256K1 secp; secp.Init();                  // sets up the field (Int::P)
+    sf_init(Int::GetFieldCharacteristic()->bits64);
     uint64_t iters = (argc > 1) ? strtoull(argv[1], nullptr, 10) : 2000000;
     int rc = correctness(iters);
     microbench();

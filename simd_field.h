@@ -158,4 +158,53 @@ static inline void fe4_sqr(fe4& out, const fe4& a) {
     sf_reduce(d, out);
 }
 
+// --- add / sub / neg / normalize (radix-2^29, magnitude-tracked) ------------
+// In a redundant radix, add and sub are limb-wise (no carry) -- cheap -- and the
+// result limbs just grow ("magnitude").  Negation/subtraction use a multiple of
+// p, 2*(m+1)*P29, large enough that no limb underflows for an input of magnitude
+// m (libsecp256k1's trick).  fe4_mul/fe4_sqr require magnitude-1 (normalized)
+// inputs (so the column sums stay < 2^64); call fe4_normalize before feeding a
+// grown value into a multiply.  P29 = the field prime's 9 limbs, set by sf_init.
+static __m256i sf_P29[9];
+
+static inline void sf_init(const uint64_t p_bits[4]) {
+    for (int i = 0; i < 9; i++)
+        sf_P29[i] = _mm256_set1_epi64x((long long)sf_get_limb(p_bits, i));
+}
+
+// r = a + b (limb-wise).  Magnitudes add: mag(r) = mag(a) + mag(b).
+static inline void fe4_add(fe4& r, const fe4& a, const fe4& b) {
+    for (int i = 0; i < 9; i++) r.l[i] = SF_ADD(a.l[i], b.l[i]);
+}
+
+// r = -a (mod p), for an input of magnitude m.  mag(r) ~ 2*(m+1).
+static inline void fe4_neg(fe4& r, const fe4& a, int m) {
+    __m256i K = _mm256_set1_epi64x(2 * (m + 1));
+    for (int i = 0; i < 9; i++)
+        r.l[i] = _mm256_sub_epi64(SF_MUL(K, sf_P29[i]), a.l[i]);
+}
+
+// r = a - b (mod p); b has magnitude mb.  mag(r) ~ mag(a) + 2*(mb+1).
+static inline void fe4_sub(fe4& r, const fe4& a, const fe4& b, int mb) {
+    __m256i K = _mm256_set1_epi64x(2 * (mb + 1));
+    for (int i = 0; i < 9; i++)
+        r.l[i] = SF_ADD(a.l[i], _mm256_sub_epi64(SF_MUL(K, sf_P29[i]), b.l[i]));
+}
+
+// Reduce any low-magnitude value (limbs < ~2^34) to < 2^256, magnitude 1.
+static inline void fe4_normalize(fe4& r) {
+    const __m256i m29 = _mm256_set1_epi64x(SF_M29);
+    const __m256i c31264 = _mm256_set1_epi64x(31264);
+    const __m256i m24 = _mm256_set1_epi64x(SF_M24);
+    const __m256i c977 = _mm256_set1_epi64x(977);
+    __m256i cc = sf_carry(r.l, 9, m29);               // -> bits >= 261 = 32R
+    r.l[0] = SF_ADD(r.l[0], SF_MUL(cc, c31264));
+    r.l[1] = SF_ADD(r.l[1], SF_SHL(cc, 8));
+    __m256i hi = SF_SHR(r.l[8], 24);                  // limb-8 bits >=256 = R
+    r.l[8] = SF_AND(r.l[8], m24);
+    r.l[0] = SF_ADD(r.l[0], SF_MUL(hi, c977));
+    r.l[1] = SF_ADD(r.l[1], SF_SHL(hi, 3));
+    sf_carry(r.l, 9, m29);
+}
+
 #endif // SIMD_FIELD_H
