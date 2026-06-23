@@ -20,6 +20,9 @@
 #include "p2pkh_decoder.h"
 #include "sha256_avx2.h"
 #include "ripemd160_avx2.h"
+#ifdef SHA_NI
+#include "sha256_ni.h"
+#endif
 #include "SECP256K1.h"
 #include "Point.h"
 #include "Int.h"
@@ -219,6 +222,11 @@ static void computeHash160BatchBinSingle3(
             shaIn[i][33] = 0x80;
             shaIn[i][34] = 0x00;
             shaIn[i][35] = 0x00;
+            // 64-bit message length (33 bytes = 264 bits) at [56..63]. The AVX2
+            // path hardcodes this as a schedule constant and ignores these bytes;
+            // SHA-NI reads the whole block, so set them once here.
+            shaIn[i][62] = 0x01;
+            shaIn[i][63] = 0x08;
         }
         init = true;
     }
@@ -231,7 +239,11 @@ static void computeHash160BatchBinSingle3(
         p[i].x.Get32Bytes(&shaIn[i][1]);
     }
 
+#ifdef SHA_NI
+    hash160_pubkey_8_ni(shaIn, outHash);   // hardware SHA-256 + AVX2 RIPEMD-160
+#else
     hash160_pubkey_8(shaIn, outHash);
+#endif
 }
 
 static void printUsage(const char* prog)

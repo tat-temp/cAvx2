@@ -54,8 +54,21 @@ Random.cpp IntGroup.cpp" ;;
     # wired into the --ilp point-reconstruction loop. A/B against `baseline`.
     ARCH_FLAGS="-mavx2 -mbmi2 -madx -DSIMD_FIELD"
     DEF_OUT="Cyclone_simd" ;;
+  shani)
+    # Hardware SHA-256 (SHA extensions) for the HASH160 step instead of 8-way
+    # AVX2 SHA -- runs on the dedicated SHA unit, off the AVX2 vector ports the
+    # EC + RIPEMD contend for. A/B against `baseline`.
+    #
+    # sha256_ni.cpp is compiled as a SEPARATE, NON-LTO object (NOLTO_SRC): the
+    # SHA-extension instructions are legacy-SSE-only, and with -flto the linker
+    # re-inlines the SHA code into the AVX2 EC loop, triggering an AVX<->SSE
+    # transition on ~every instruction (~18x slower!). Isolating the TU keeps the
+    # SHA as one legacy block with a single zeroupper-guarded boundary.
+    ARCH_FLAGS="-mavx2 -mbmi2 -madx -msha -DSHA_NI"
+    DEF_OUT="Cyclone_shani"
+    NOLTO_SRC="sha256_ni.cpp" ;;
   *)
-    echo "usage: $0 [baseline|native|adx|fused|simdtest|simdfield] [output-name]" >&2; exit 2 ;;
+    echo "usage: $0 [baseline|native|adx|fused|simdtest|simdfield|shani] [output-name]" >&2; exit 2 ;;
 esac
 OUT="${OUT:-$DEF_OUT}"
 
@@ -64,9 +77,18 @@ COMMON="-std=c++17 -O3 -funroll-loops -ftree-vectorize -fstrict-aliasing \
 -fipa-ra -fipa-modref -flto -fassociative-math -fopenmp"
 
 SRC="Cyclone.cpp SECP256K1.cpp Int.cpp IntGroup.cpp IntMod.cpp Point.cpp \
-ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp"
+ripemd160_avx2.cpp p2pkh_decoder.cpp sha256_avx2.cpp ${EXTRA_SRC:-}"
 SRC="${SRC_OVERRIDE:-$SRC}"
 
 set -x
+# NON-LTO objects (see the `shani` note): compiled in isolation so -flto can't
+# inline them into a mismatched-ISA hot loop.
+NOLTO_OBJS=""
+for f in ${NOLTO_SRC:-}; do
+  obj="${f%.cpp}.nolto.o"
+  # shellcheck disable=SC2086
+  g++ -std=c++17 -O3 $ARCH_FLAGS -c "$f" -o "$obj"
+  NOLTO_OBJS="$NOLTO_OBJS $obj"
+done
 # shellcheck disable=SC2086
-g++ $COMMON $ARCH_FLAGS -o "$OUT" $SRC
+g++ $COMMON $ARCH_FLAGS -o "$OUT" $SRC $NOLTO_OBJS
