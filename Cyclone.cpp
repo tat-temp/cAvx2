@@ -244,7 +244,7 @@ static void printUsage(const char* prog)
         << "                  (no real target needed) and exit\n"
         << "  --skip-hash     skip SHA-256/RIPEMD-160 (EC point-gen only) to\n"
         << "                  profile the EC vs hashing split\n"
-        << "  --ilp <0-8>     EC point-loop interleave width (0 = original loop,\n"
+        << "  --ilp <0-16>    EC point-loop interleave width (0 = original loop,\n"
         << "                  N>0 = interleave 2xN independent point chains)\n"
         << "  --selftest [N]  validate field ModMulK1/ModSquareK1 against an\n"
         << "                  independent full-multiply/division oracle and exit\n";
@@ -432,8 +432,8 @@ int main(int argc, char* argv[])
         }
         else if (!std::strcmp(argv[i], "--ilp") && i + 1 < argc) {
             ilpWidth = std::stoi(argv[++i]);
-            if (ilpWidth < 0 || ilpWidth > 8) {
-                std::cerr << "--ilp must be 0..8 (0 = original loop)\n"; return 1;
+            if (ilpWidth < 0 || ilpWidth > 16) {
+                std::cerr << "--ilp must be 0..16 (0 = original loop)\n"; return 1;
             }
         }
         else if (!std::strcmp(argv[i], "--selftest")) {
@@ -550,7 +550,7 @@ int main(int argc, char* argv[])
 
         // Interleave scratch for the --ilp point loop: MAXW independent (+G) and
         // (-G) chains processed in lockstep to hide field-multiply latency.
-        static const int MAXW = 8;
+        static const int MAXW = 16;
         Int dyf[MAXW], sf[MAXW], pf[MAXW];
         Int dyb[MAXW], sb[MAXW], pb[MAXW];
         Point ppA[MAXW], pnA[MAXW];

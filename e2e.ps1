@@ -1,7 +1,7 @@
 # Minimal end-to-end find gate. Derives addresses independently (Python ecdsa),
 # runs the binary over a range containing each key, and checks the reported
 # private key matches. Usage:  ./e2e.ps1 -Exe Cyclone.exe
-param([string]$Exe = "Cyclone.exe", [string]$Range = "1:3FFF")
+param([string]$Exe = "Cyclone.exe", [string]$Range = "1:3FFF", [string]$Extra = "")
 $ErrorActionPreference = "Stop"
 $Exe = (Resolve-Path $Exe).Path   # cwd is not on PATH; resolve to a full path
 
@@ -28,7 +28,8 @@ $fail = 0
 foreach ($line in $pairs) {
     $kHex, $addr = $line.Trim().Split(' ')
     $want = $kHex.TrimStart('0'); if ($want -eq '') { $want = '0' }
-    $out = & $Exe -r $Range -a $addr -t 1 2>&1 | Out-String
+    $extraArgs = if ($Extra) { $Extra.Split(' ') } else { @() }
+    $out = & $Exe -r $Range -a $addr -t 1 @extraArgs 2>&1 | Out-String
     $m = [regex]::Match($out, 'Private Key\s*:\s*([0-9a-fA-F]+)')
     $got = if ($m.Success) { $m.Groups[1].Value.TrimStart('0').ToLower() } else { '<none>' }
     if ($got -eq '') { $got = '0' }
