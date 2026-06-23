@@ -24,6 +24,9 @@
 #include "Point.h"
 #include "Int.h"
 #include "IntGroup.h"
+#ifdef SIMD_FIELD
+#include "simd_field.h"
+#endif
 
 #ifdef _MSC_VER
 #define ALIGN32 __declspec(align(32))
@@ -518,6 +521,9 @@ int main(int argc, char* argv[])
 
     Secp256K1 secp;
     secp.Init();
+#ifdef SIMD_FIELD
+    sf_init(Int::GetFieldCharacteristic()->bits64);   // P29 limbs for fe4 sub/neg
+#endif
 
 #pragma omp parallel num_threads(numCPUs) \
     shared(globalChecked,globalElapsed,mkeys,matchFound,benchStop, \
@@ -570,6 +576,20 @@ int main(int argc, char* argv[])
         }
         // _2Gn = groupSize*G
         _2Gn = secp.DoubleDirect(Gn[groupSize / 2 - 1]);
+
+#ifdef SIMD_FIELD
+        // Pre-pack the fixed Gn[] table into 4-lane fe4 form once per thread
+        // (x and y of 4 consecutive generators per fe4). dx[]/startP are packed
+        // per group below; Gn never changes.
+        int nG4 = hLength / 4;
+        std::vector<fe4> Gn4x(nG4), Gn4y(nG4);
+        for (int g = 0; g < nG4; g++) {
+            Gn4x[g] = fe4_pack(Gn[4*g].x.bits64, Gn[4*g+1].x.bits64,
+                               Gn[4*g+2].x.bits64, Gn[4*g+3].x.bits64);
+            Gn4y[g] = fe4_pack(Gn[4*g].y.bits64, Gn[4*g+1].y.bits64,
+                               Gn[4*g+2].y.bits64, Gn[4*g+3].y.bits64);
+        }
+#endif
 
         ALIGN32 uint8_t hashRes[HASH_BATCH_SIZE][20];
 
@@ -708,6 +728,78 @@ int main(int argc, char* argv[])
                 emit(pn, groupSize / 2 - (j + 1));
             }
           } else {
+#ifdef SIMD_FIELD
+            // --- 4-way AVX2 SIMD point reconstruction (radix-2^29). Four
+            //     consecutive (+G)/(-G) chains per fe4. Magnitudes are tracked
+            //     (see simd_field.h) so a multiply's column sum stays < 2^64;
+            //     we normalize only before reuse-in-a-multiply or before emit.
+            {
+              fe4 SPX = fe4_pack(startP.x.bits64, startP.x.bits64,
+                                 startP.x.bits64, startP.x.bits64);
+              fe4 SPY = fe4_pack(startP.y.bits64, startP.y.bits64,
+                                 startP.y.bits64, startP.y.bits64);
+              Int* Pfield = Int::GetFieldCharacteristic();   // = _P (Int::P is unset!)
+              auto toPoint = [&](const fe4& fx, const fe4& fy, int l, Point& P) {
+                  uint64_t w[4];
+                  fe4_unpack_lane(fx, l, w);
+                  P.x.bits64[0]=w[0]; P.x.bits64[1]=w[1];
+                  P.x.bits64[2]=w[2]; P.x.bits64[3]=w[3]; P.x.bits64[4]=0;
+                  while (P.x.IsGreaterOrEqual(Pfield)) P.x.Sub(Pfield);   // -> [0,P)
+                  fe4_unpack_lane(fy, l, w);
+                  P.y.bits64[0]=w[0]; P.y.bits64[1]=w[1];
+                  P.y.bits64[2]=w[2]; P.y.bits64[3]=w[3]; P.y.bits64[4]=0;
+                  while (P.y.IsGreaterOrEqual(Pfield)) P.y.Sub(Pfield);
+              };
+              int nfull = hLength & ~3;
+              for (int jb = 0; jb < nfull; jb += 4) {
+                  const fe4& GnX = Gn4x[jb >> 2];
+                  const fe4& GnY = Gn4y[jb >> 2];
+                  fe4 DX = fe4_pack(dx[jb].bits64, dx[jb+1].bits64,
+                                    dx[jb+2].bits64, dx[jb+3].bits64);
+
+                  fe4 dyf; fe4_sub(dyf, GnY, SPY, 1);          // +G: dy = Gn.y - startP.y
+                  fe4 t;   fe4_add(t, GnY, SPY);
+                  fe4 dyb; fe4_neg(dyb, t, 2);                 // -G: dy = -(Gn.y+startP.y)
+                  fe4 sf;  fe4_mul(sf, dyf, DX);               // s = dy * dxinv
+                  fe4 sb;  fe4_mul(sb, dyb, DX);
+                  fe4 pf;  fe4_sqr(pf, sf);                    // s^2
+                  fe4 pb;  fe4_sqr(pb, sb);
+
+                  fe4 ppx; fe4_sub(ppx, pf, GnX, 1); fe4_sub(ppx, ppx, SPX, 1);
+                  fe4_normalize(ppx);                          // rx = s^2 - x1 - x2
+                  fe4 pnx; fe4_sub(pnx, pb, GnX, 1); fe4_sub(pnx, pnx, SPX, 1);
+                  fe4_normalize(pnx);
+
+                  fe4 ppy; fe4_sub(ppy, GnX, ppx, 1); fe4_mul(ppy, ppy, sf);
+                  fe4_sub(ppy, ppy, GnY, 1); fe4_normalize(ppy);   // ry = s*(x2-rx) - y2
+                  fe4 pny; fe4_sub(pny, GnX, pnx, 1); fe4_mul(pny, pny, sb);
+                  fe4_add(pny, pny, GnY); fe4_normalize(pny);      // ry = s*(x2-rx) + y2
+
+                  for (int l = 0; l < 4; l++) {
+                      int jx = jb + l;
+                      Point P;
+                      toPoint(ppx, ppy, l, P); emit(P, groupSize / 2 + (jx + 1));
+                      toPoint(pnx, pny, l, P); emit(P, groupSize / 2 - (jx + 1));
+                  }
+              }
+              // remainder (hLength % 4 points): scalar, same formula
+              for (int j2 = nfull; j2 < hLength; j2++) {
+                  Point pp2 = startP, pn2 = startP;
+                  Int dy2, dyn2, s2, p2;
+                  dy2.ModSub(&Gn[j2].y, &pp2.y);
+                  s2.ModMulK1(&dy2, &dx[j2]); p2.ModSquareK1(&s2);
+                  pp2.x.ModNeg(); pp2.x.ModAdd(&p2); pp2.x.ModSub(&Gn[j2].x);
+                  pp2.y.ModSub(&Gn[j2].x, &pp2.x); pp2.y.ModMulK1(&s2); pp2.y.ModSub(&Gn[j2].y);
+                  dyn2.Set(&Gn[j2].y); dyn2.ModNeg(); dyn2.ModSub(&pn2.y);
+                  s2.ModMulK1(&dyn2, &dx[j2]); p2.ModSquareK1(&s2);
+                  pn2.x.ModNeg(); pn2.x.ModAdd(&p2); pn2.x.ModSub(&Gn[j2].x);
+                  pn2.y.ModSub(&Gn[j2].x, &pn2.x); pn2.y.ModMulK1(&s2); pn2.y.ModAdd(&Gn[j2].y);
+                  emit(pp2, groupSize / 2 + (j2 + 1));
+                  emit(pn2, groupSize / 2 - (j2 + 1));
+              }
+              j = hLength;
+            }
+#else
             // --- ILP: process 2*W independent chains in lockstep so the
             //     dependent field-multiply latencies overlap. Each step is the
             //     same op for all W forward (+G) and W backward (-G) points.
@@ -749,6 +841,7 @@ int main(int argc, char* argv[])
                 }
             }
             j = hLength;
+#endif
           }
 
             // First point (startP - (GRP_SZIE/2)*G)

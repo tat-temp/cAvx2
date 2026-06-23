@@ -49,8 +49,13 @@ case "$ARCH" in
     DEF_OUT="simdtest"
     SRC_OVERRIDE="simd_test.cpp Int.cpp IntMod.cpp Point.cpp SECP256K1.cpp \
 Random.cpp IntGroup.cpp" ;;
+  simdfield)
+    # Tier 3 (Milestone C): 4-way AVX2 SIMD field arithmetic (simd_field.h)
+    # wired into the --ilp point-reconstruction loop. A/B against `baseline`.
+    ARCH_FLAGS="-mavx2 -mbmi2 -madx -DSIMD_FIELD"
+    DEF_OUT="Cyclone_simd" ;;
   *)
-    echo "usage: $0 [baseline|native|adx|fused|simdtest] [output-name]" >&2; exit 2 ;;
+    echo "usage: $0 [baseline|native|adx|fused|simdtest|simdfield] [output-name]" >&2; exit 2 ;;
 esac
 OUT="${OUT:-$DEF_OUT}"
 
